@@ -1,0 +1,140 @@
+//user is like a user 
+Table users {
+  id integer [pk, increment]
+  companyId integer [ref: > companies.id]
+  branchId integer [ref: > branches.id]
+  name varchar
+  email varchar [unique]
+  emailVerified boolean [default: false]
+  passwordHash varchar 
+  phone varchar 
+  profilePhoto varchar
+  status  status 
+  isOnline boolean [default: false]
+  userRole userRole
+  lastLogin date 
+  createdAt timestamp
+}
+  enum status{
+    active
+    inactive
+    blocked
+  }
+  enum userRole{
+    rootAdmin //never change 
+    admin 
+    viewer 
+    bidManager 
+    TripManager 
+    accounts
+  }
+
+
+
+Table companies{
+  id integer [pk, increment]
+  companyName varchar
+  enrouteCompanyId varchar [unique]
+  companyType cType
+  gstNumber varchar
+  panNumber varchar
+  companyEmail varchar
+  comopanyPhone varchar                    
+  logo varchar 
+  status companyStatus
+  createdAt timestamp
+ 
+}
+  enum companyStatus{
+    pending
+    rejected
+    approved
+    blocked
+  }
+
+  Enum cType{
+    customer
+    transputer
+    broker
+    fleetOwner 
+  
+  }
+
+
+//branch is for we find out which employ belong which company branch 
+table branches{ 
+   id integer [pk, increment]
+   companyId integer [ref: > companies.id]
+   branchesName varchar
+   branchesCode varchar
+   city varchar
+   state varchar
+   status status 
+   branchAdress varchar
+
+} 
+  
+
+
+table subscriptionPlane{
+   id integer [pk, increment]
+   planeName subscriptionPlaneNAme
+   maxUsers integer
+   monthlyPrice integer
+}
+
+  Enum subscriptionPlaneName{
+    Starter
+    Pro
+    Enterprise
+    Custom
+  }
+table companySubscription{
+  companyId integer [ref: > companies.id]
+  planId integer [ref: > subscriptionPlane.id]
+  allowedUsers integer
+  startDate timestamp
+  expiryDate timestamp
+  paymentStatus paymentStatus
+  
+}
+  enum paymentStatus{
+    pending
+    paid 
+    failed
+  }
+
+
+
+table documents{
+    id integer [pk, increment]
+    companyId integer [ref: > companies.id]
+    documentType docType
+    fileUrl varchar
+ }
+ enum docType{
+  GST
+  PAN
+  Logo
+  RC
+  Insurance   
+  PaymentProof
+ }
+
+
+
+table companyConnection{
+    id integer [pk, increment]
+    sourceCompanyId integer [ref: > companies.id]
+    targetCOmpanyId integer [ref: > companies.id]
+    connctionType cType
+    state connectionStatus     
+      createdAt timestamp
+    acceptedAt timestamp
+}
+  Enum connectionStatus {
+  pending
+  accepted
+  rejected
+  blocked
+}
