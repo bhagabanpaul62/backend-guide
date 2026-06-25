@@ -10,7 +10,8 @@
 1. [Chapter 1: Setting Up the Backend](#chapter-1-setting-up-the-backend)
 2. [Chapter 2: Utility Functions & Error Handling System](#chapter-2-utility-functions--error-handling-system)
 3. [Chapter 3: Setting Up Email Notification System](#chapter-3-setting-up-email-notification-system)
-2. [Chapter 2: Utility Functions & Error Handling System](#chapter-2-utility-functions--error-handling-system)
+4. [Chapter 4: Authentication System (OTP, Register, JWT)](#chapter-4-authentication-system-otp-register-jwt)
+5. [Chapter 5: File Upload System (Multer + Cloudflare R2)](#chapter-5-file-upload-system-multer--cloudflare-r2)
 
 ---
 
@@ -1065,3 +1066,590 @@ import { sendOtpEmail } from '#services/email/email.service.js';
 ---
 
 *Chapter 3 complete. Next: Chapter 4 - Authentication (JWT, Sessions, Middleware)*
+
+
+---
+
+---
+
+# Chapter 4: Authentication System (OTP, Register, JWT)
+
+## 4.1 The Big Picture - Why This Architecture?
+
+Most beginners put email + password login only. But for a B2B SaaS platform you need:
+- Email verification before registration (OTP)
+- Company + user created together
+- Admin approval before login is allowed
+- JWT tokens for session management
+- One user = one active session (prevent credential sharing)
+
+---
+
+## 4.2 JWT - JSON Web Token
+
+### What is JWT?
+
+After login, the server gives the user a token (like a wristband at a concert). Every future request, the user shows that token. Server reads it and knows who they are.
+
+A JWT looks like:
+```
+eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOjF9.abc123xyz
+```
+
+Three parts separated by dots:
+```
+HEADER . PAYLOAD . SIGNATURE
+```
+
+### Payload (what you store inside the token):
+```javascript
+{
+  userId: "uuid",
+  companyId: "uuid",
+  role: "admin",
+  sessionId: "uuid"
+}
+```
+
+**Never store:** password, GST, PAN, sensitive documents.
+
+### Two Tokens Strategy
+
+| Token | Expires | Purpose |
+|-------|---------|---------|
+| Access Token | 15 minutes | Authorize every API request |
+| Refresh Token | 30 days | Generate new access token silently |
+
+**Why two?**
+Access token expires fast → less damage if stolen.
+Refresh token lets users stay logged in for 30 days without re-entering password.
+
+### JWT Utility (`utils/jwt.js`)
+
+```javascript
+import jwt from 'jsonwebtoken';
+
+export function generateAccessToken(payload) {
+  return jwt.sign(payload, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN   // '15m'
+  });
+}
+
+export function generateRefreshToken(payload) {
+  return jwt.sign(payload, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN   // '30d'
+  });
+}
+
+export function verifyToken(token) {
+  return jwt.verify(token, process.env.JWT_SECRET);
+  // Let it throw naturally - asyncHandler catches it
+  // JsonWebTokenError → invalid
+  // TokenExpiredError → expired
+}
+```
+
+**Key rule:** Never wrap `verifyToken` in try/catch. Let it throw. asyncHandler catches it and errorHandler sends 401.
+
+---
+
+## 4.3 Registration Flow (Multi-Step)
+
+### The complete flow:
+
+```
+Step 1: POST /auth/send-otp
+        → Generate 6-digit OTP (crypto.randomInt)
+        → Delete old OTPs for this email
+        → Save new OTP to DB (expires in 10 min)
+        → Send OTP email
+
+Step 2: POST /auth/verify-otp
+        → Find OTP in DB (email + isUsed=false + not expired)
+        → Compare OTP
+        → Mark as isUsed=true
+        → Check if user exists → return { userExists }
+        → Frontend decides: show register form or login page
+
+Step 3: POST /auth/register
+        → Text data: user + company + branch info
+        → Validate all fields
+        → Check duplicates (company email, user email, GST)
+        → Hash password (bcrypt, 12 rounds)
+        → Generate enrouteCompanyId
+        → INSERT company (status: 'draft')
+        → INSERT user (linked to company)
+        → INSERT branch (linked to company + user)
+        → UPDATE user with branchId
+        → Respond with { companyId, userId, branchId }
+
+Step 4: POST /documents/upload (x3-4 times)
+        → Each call uploads one document
+        → File goes to Cloudflare R2
+        → URL saved in documents table
+
+Step 5: POST /auth/submit-registration
+        → Check all required documents uploaded
+        → Change company status: draft → pending
+        → Send welcome email
+        → Admin reviews and approves
+```
+
+---
+
+## 4.4 OTP Implementation
+
+### Generate secure OTP:
+```javascript
+import crypto from 'crypto';
+
+// Better than Math.random() - cryptographically secure
+const otp = crypto.randomInt(100000, 999999).toString();
+// Always 6 digits: "847392"
+```
+
+### Save to DB:
+```javascript
+const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+// Date.now()      = current time in milliseconds
+// 10 * 60 * 1000 = 10 minutes in milliseconds
+// new Date(...)   = convert to Date object
+
+await db.insert(otpVerification).values({
+  email,
+  otp,
+  expiresAt,
+  isUsed: false
+});
+```
+
+### Verify OTP:
+```javascript
+import { and, eq, gt } from 'drizzle-orm';
+
+const data = await db.select()
+  .from(otpVerification)
+  .where(
+    and(
+      eq(otpVerification.email, email),
+      eq(otpVerification.isUsed, false),
+      gt(otpVerification.expiresAt, new Date())   // expiresAt > now
+    )
+  )
+  .limit(1);
+
+if (data.length === 0) {
+  throw new AppError('OTP expired or invalid', 400);
+}
+
+if (data[0].otp !== otp) {
+  throw new AppError('Invalid OTP', 400);
+}
+
+// Mark as used
+await db.update(otpVerification)
+  .set({ isUsed: true })
+  .where(eq(otpVerification.id, data[0].id));
+```
+
+---
+
+## 4.5 Password Hashing
+
+**Never store plain passwords. Always hash with bcrypt.**
+
+```javascript
+import bcrypt from 'bcrypt';
+
+// Hash on registration
+const hashedPassword = await bcrypt.hash(password, 12);
+// 12 = salt rounds (higher = more secure but slower)
+// Industry standard: 10-12
+
+// Compare on login
+const isValid = await bcrypt.compare(enteredPassword, storedHash);
+// Returns true or false
+```
+
+---
+
+## 4.6 Enroute Company ID Generation
+
+Every company gets a unique ID based on their type:
+- `CUS-XXXXXXXX` → Customer
+- `TRN-XXXXXXXX` → Transporter
+- `BRK-XXXXXXXX` → Broker
+- `FLT-XXXXXXXX` → Fleet Owner
+
+**Generator function pattern:**
+```javascript
+import crypto from 'crypto';
+
+export const generateEnrouteId = (companyType) => {
+  const prefix = {
+    customer: 'CUS',
+    transporter: 'TRN',
+    broker: 'BRK',
+    fleetOwner: 'FLT',
+  };
+
+  const selectedPrefix = prefix[companyType];
+
+  if (!selectedPrefix) {
+    throw new Error('Invalid company type');
+  }
+
+  // crypto.randomUUID() = "550e8400-e29b-41d4-a716-446655440000"
+  // .slice(0, 8) = "550e8400"
+  // .toUpperCase() = "550E8400"
+  return `${selectedPrefix}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+};
+```
+
+---
+
+## 4.7 Creating Multiple Records Sequentially
+
+When registration creates company + user + branch, you must do them in order because each needs the ID from the previous:
+
+```javascript
+// Step 1: Create company → get ID
+const [newCompany] = await db.insert(companies)
+  .values({ companyName, ... })
+  .returning();
+// newCompany.id is now available
+
+// Step 2: Create user with company ID
+const [newUser] = await db.insert(users)
+  .values({ companyId: newCompany.id, ... })
+  .returning();
+// newUser.id is now available
+
+// Step 3: Create branch with company and user ID
+const [newBranch] = await db.insert(branch)
+  .values({ companyId: newCompany.id, userId: newUser.id, ... })
+  .returning();
+
+// Step 4: Update user with branch ID
+await db.update(users)
+  .set({ branchId: newBranch.id })
+  .where(eq(users.id, newUser.id));
+```
+
+**Key:** `.returning()` gives you back the inserted row including its auto-generated UUID.
+
+---
+
+## 4.8 Company Status Lifecycle
+
+```
+draft       → Just registered, documents not uploaded yet
+pending     → All docs uploaded, waiting for admin review
+approved    → Admin verified, user can login
+rejected    → Admin rejected (can reapply)
+blocked     → Admin blocked (cannot access platform)
+```
+
+---
+
+## 4.9 Environment Variables for Auth
+
+```env
+JWT_SECRET=minimum-32-characters-random-string
+JWT_EXPIRES_IN=15m
+JWT_REFRESH_EXPIRES_IN=30d
+```
+
+---
+
+## 4.10 Auth Routes Summary
+
+```
+POST /api/v1/auth/send-otp
+POST /api/v1/auth/verify-otp
+POST /api/v1/auth/register
+POST /api/v1/auth/submit-registration
+POST /api/v1/auth/login             (next to build)
+POST /api/v1/auth/logout            (next to build)
+POST /api/v1/auth/refresh-token     (next to build)
+POST /api/v1/auth/forgot-password   (future)
+POST /api/v1/auth/reset-password    (future)
+```
+
+---
+
+## 4.11 Common Mistakes in Auth
+
+| Mistake | Correct Approach |
+|---------|-----------------|
+| `Math.random()` for OTP | Use `crypto.randomInt()` |
+| Storing plain password | Always `bcrypt.hash()` |
+| Storing JWT in localStorage | Use HttpOnly cookies |
+| No OTP expiry check | Always check `expiresAt > now` |
+| Not marking OTP as used | Always set `isUsed: true` after verify |
+| Missing `return` on validation | Always add `return` before response |
+| `!data` check on DB result | DB always returns array - check `data.length === 0` |
+
+---
+
+---
+
+# Chapter 5: File Upload System (Multer + Cloudflare R2)
+
+## 5.1 Why You Can't Use `express.json()` for Files
+
+When frontend sends JSON:
+```
+Content-Type: application/json
+```
+Express reads it fine with `app.use(express.json())`.
+
+When frontend sends a file:
+```
+Content-Type: multipart/form-data
+```
+This is binary data mixed with text. Express cannot parse this. You need **Multer**.
+
+---
+
+## 5.2 What Multer Does
+
+Multer parses `multipart/form-data` and puts:
+- Text fields → `req.body`
+- Uploaded file → `req.file` (single) or `req.files` (multiple)
+
+Without Multer: `req.file = undefined`
+With Multer: `req.file = { buffer, originalname, mimetype, size }`
+
+---
+
+## 5.3 Storage Types
+
+### Disk Storage
+File saved on server's hard disk.
+- Problem: Server restart = files survive but disk fills up
+- Problem: Multiple servers = file on wrong server
+- NOT recommended for production
+
+### Memory Storage (Use This)
+File held in RAM as a buffer.
+- You immediately send buffer to cloud storage (R2)
+- Nothing saved on server disk
+- Recommended for production
+
+```javascript
+const storage = multer.memoryStorage();
+```
+
+---
+
+## 5.4 Multer Configuration (`middleware/upload.middleware.js`)
+
+```javascript
+import multer from 'multer';
+import { AppError } from '#utils/AppError.js';
+
+const storage = multer.memoryStorage();
+
+export const upload = multer({
+  storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024   // 5MB max
+    // 5 * 1024 = 5KB * 1024 = 5MB in bytes
+  },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf'];
+
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);    // null = no error, true = accept file
+    } else {
+      cb(new AppError('Only JPG, PNG and PDF allowed', 400), false);
+    }
+  }
+});
+```
+
+### Usage in routes:
+```javascript
+// upload.single('file') = expect one file with field name 'file'
+router.post('/upload', upload.single('file'), uploadDocument);
+//                     ↑ middleware           ↑ controller
+//                     runs first             runs after
+```
+
+---
+
+## 5.5 What is Cloudflare R2?
+
+R2 is cloud object storage (like a hard drive on the internet):
+- You upload a file → R2 stores it permanently
+- R2 gives you a public URL
+- Files survive server restarts
+- Cheaper than AWS S3
+- Uses the same API as S3
+
+**Why not store on your server?**
+- Server restarts: files might be lost
+- Multiple servers: file exists on only one
+- Storage costs: server disk is expensive
+- CDN: R2 serves files fast worldwide
+
+---
+
+## 5.6 Setting Up R2 Client (`services/storage/r2.service.js`)
+
+R2 uses the S3-compatible API from `@aws-sdk/client-s3`:
+
+```javascript
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+
+// Create connection once - reuse for all uploads
+const r2Client = new S3Client({
+  region: 'auto',   // R2 doesn't use regions like AWS
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  }
+});
+
+export const uploadToR2 = async (file, companyId, documentType) => {
+  // 1. Get file extension
+  const extension = file.originalname.split('.').pop();
+  // "gst-certificate.pdf".split('.') = ['gst-certificate', 'pdf']
+  // .pop() = 'pdf' (last item)
+
+  // 2. Create unique path
+  const filename = `companies/${companyId}/${documentType}-${Date.now()}.${extension}`;
+  // Result: "companies/abc-123/gst-1718345678.pdf"
+  // Date.now() = milliseconds since 1970 = always unique
+
+  // 3. Upload to R2
+  await r2Client.send(new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: filename,          // path inside bucket
+    Body: file.buffer,      // raw file bytes from multer memory storage
+    ContentType: file.mimetype,
+  }));
+
+  // 4. Return public URL
+  return `${process.env.R2_PUBLIC_URL}/${filename}`;
+};
+```
+
+---
+
+## 5.7 Document Upload Controller
+
+```javascript
+export const uploadDocument = asyncHandler(async (req, res) => {
+  // 1. Get data
+  const { companyId, documentType } = req.body;
+  const file = req.file;   // set by multer middleware
+
+  // 2. Validate
+  if (!companyId || !documentType || !file) {
+    return validationErrorResponse(res, 'All fields required', {...});
+  }
+
+  // 3. Validate document type
+  const validTypes = ['gst', 'pan', 'logo', 'rc', 'insurance', 'paymentProof'];
+  if (!validTypes.includes(documentType)) {
+    throw new AppError('Invalid document type', 400);
+  }
+
+  // 4. Upload to R2 → get URL
+  const fileUrl = await uploadToR2(file, companyId, documentType);
+
+  // 5. Save URL to database
+  const [newDoc] = await db.insert(documents).values({
+    companyId,
+    documentType,
+    fileUrl
+  }).returning();
+
+  // 6. Respond
+  return successResponse(res, {
+    documentId: newDoc.id,
+    documentType: newDoc.documentType,
+    fileUrl: newDoc.fileUrl
+  }, 'Document uploaded successfully', 201);
+});
+```
+
+---
+
+## 5.8 Testing File Upload with Postman/Thunder Client
+
+```
+POST http://localhost:8000/api/v1/documents/upload
+Content-Type: multipart/form-data   ← auto-set by Postman
+
+Body (form-data):
+  file         → [select file button] choose a PDF
+  companyId    → paste UUID from registration response
+  documentType → "gst"
+```
+
+---
+
+## 5.9 File Naming Strategy
+
+Good naming prevents collisions:
+
+```
+companies/{companyId}/{documentType}-{timestamp}.{ext}
+
+Examples:
+companies/abc-123/gst-1718345678.pdf
+companies/abc-123/pan-1718345679.jpg
+companies/xyz-456/gst-1718345680.pdf
+```
+
+**Why timestamp?**
+Two companies cannot overwrite each other (different `companyId` folders).
+Same company uploading same document twice → different timestamp → no overwrite.
+
+---
+
+## 5.10 Environment Variables for R2
+
+```env
+R2_ACCOUNT_ID=your-cloudflare-account-id
+R2_ACCESS_KEY_ID=your-r2-access-key
+R2_SECRET_ACCESS_KEY=your-r2-secret-key
+R2_BUCKET_NAME=enroute-documents
+R2_PUBLIC_URL=https://pub-xxxxxxxx.r2.dev
+```
+
+**Where to find:**
+- Account ID: Cloudflare Dashboard → Right sidebar
+- Access Key + Secret: R2 → Manage R2 API Tokens → Create Token
+- Public URL: R2 → Your Bucket → Settings → Enable Public Access
+
+---
+
+## 5.11 Packages Required
+
+```bash
+pnpm add multer
+pnpm add @aws-sdk/client-s3
+```
+
+---
+
+## 5.12 Common Mistakes in File Upload
+
+| Mistake | Correct Approach |
+|---------|-----------------|
+| Using disk storage | Use `memoryStorage()` |
+| No file size limit | Set `fileSize: 5 * 1024 * 1024` |
+| No file type check | Always add `fileFilter` |
+| Variable name mismatch | `filename` vs `fileName` - be consistent |
+| Missing `async` on upload function | R2 upload is async, always add `async` |
+| No `Content-Type` in upload | Always set `ContentType: file.mimetype` |
+| Storing file URL wrong | Use the variable name you defined |
+
+---
+
+*Chapter 5 complete. Next: Chapter 6 - Login, Logout, Session Management*
