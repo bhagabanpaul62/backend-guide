@@ -1,4 +1,5 @@
 # Backend Essentials
+
 ### A Personal Reference Guide - Written from Real Experience Building EnrouteLogTech
 
 > Read this before starting any new backend project. Every concept here was learned by actually building something real.
@@ -71,18 +72,18 @@ pnpm add -D nodemon drizzle-kit
 
 **What each package does:**
 
-| Package | Purpose |
-|---------|---------|
-| `express` | Web framework |
-| `dotenv` | Load environment variables from .env |
-| `helmet` | Adds security headers automatically |
-| `cors` | Allows frontend to call your API |
-| `bcrypt` | Hash passwords (never store plain passwords) |
-| `jsonwebtoken` | Create and verify JWT tokens |
-| `express-validator` | Validate request body inputs |
-| `drizzle-orm` | Type-safe ORM for database |
-| `pg` | PostgreSQL driver |
-| `nodemon` | Auto-restart server on file changes |
+| Package             | Purpose                                      |
+| ------------------- | -------------------------------------------- |
+| `express`           | Web framework                                |
+| `dotenv`            | Load environment variables from .env         |
+| `helmet`            | Adds security headers automatically          |
+| `cors`              | Allows frontend to call your API             |
+| `bcrypt`            | Hash passwords (never store plain passwords) |
+| `jsonwebtoken`      | Create and verify JWT tokens                 |
+| `express-validator` | Validate request body inputs                 |
+| `drizzle-orm`       | Type-safe ORM for database                   |
+| `pg`                | PostgreSQL driver                            |
+| `nodemon`           | Auto-restart server on file changes          |
 
 ---
 
@@ -108,6 +109,7 @@ JWT_REFRESH_EXPIRES_IN=30d
 ```
 
 **Rules:**
+
 - Add `.env` to `.gitignore` immediately
 - Create a `.env.example` with empty values for teammates
 - Never hardcode secrets in your code
@@ -138,11 +140,344 @@ Add to `package.json`:
 
 ---
 
-## 1.5 The `app.js` File (Express Setup)
+## 1.5 Database Setup (Docker + PostgreSQL + Drizzle ORM)
+
+### 1.5.1 Docker Compose - Running PostgreSQL
+
+Instead of installing PostgreSQL on your computer, run it in Docker. Create `docker-compose.yml` in your project root:
+
+```yaml
+services:
+  postgres:
+    image: postgres:18.4
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: enroute
+      POSTGRES_USER: enrouteDb
+      POSTGRES_PASSWORD: enroute09832
+```
+
+**Commands:**
+
+```bash
+docker-compose up -d      # Start PostgreSQL (runs in background)
+docker-compose down       # Stop PostgreSQL
+docker ps                 # Check if it's running
+docker volume prune -f    # Reset database (deletes all data)
+```
+
+**Your `.env` DATABASE_URL must match docker-compose credentials:**
+
+```env
+DATABASE_URL="postgres://enrouteDb:enroute09832@localhost:5432/enroute"
+#                        ↑ user     ↑ password    ↑ host  ↑port ↑ db name
+```
+
+---
+
+### 1.5.2 Drizzle ORM - Database Connection
+
+Drizzle connects your Express app to PostgreSQL. Create `src/db/index.js`:
+
+```javascript
+import { drizzle } from "drizzle-orm/node-postgres";
+
+export const db = drizzle(process.env.DATABASE_URL);
+```
+
+That's it. One line. `db` is now your connection to PostgreSQL.
+
+**How you use `db` everywhere:**
+
+```javascript
+import { db } from '#db/index.js';
+
+await db.select().from(users);            // READ
+await db.insert(users).values({...});     // CREATE
+await db.update(users).set({...});        // UPDATE
+await db.delete(users).where(...);        // DELETE
+```
+
+---
+
+### 1.5.3 Drizzle Config (`drizzle.config.js`)
+
+Create `drizzle.config.js` in your backend root. This tells Drizzle Kit where your schemas are and how to connect:
+
+```javascript
+import "dotenv/config";
+import { defineConfig } from "drizzle-kit";
+
+export default defineConfig({
+  dialect: "postgresql",
+  out: "./drizzle", // where migration files go
+  schema: "./src/db/Schemas/**/*.js", // where your schema files are
+  dbCredentials: {
+    url: process.env.DATABASE_URL,
+  },
+});
+```
+
+**Important settings:**
+
+- `dialect` → must be `'postgresql'` for Postgres
+- `schema` → glob pattern finds ALL .js files in Schemas folder
+- `out` → folder where migration SQL files are saved
+
+---
+
+### 1.5.4 Drizzle Commands
+
+```bash
+# Push schema directly to DB (development - fast, no migration files)
+pnpm drizzle-kit push
+
+# Generate migration files (production - creates SQL files)
+pnpm drizzle-kit generate
+
+# Apply migrations to DB
+pnpm drizzle-kit migrate
+
+# Open visual database browser
+pnpm drizzle-kit studio
+```
+
+**When to use which:**
+
+- `push` → development, quick iteration
+- `generate` + `migrate` → production, needs history
+
+---
+
+### 1.5.5 Schema File Structure
+
+Organize schemas by business domain:
+
+```
+src/db/
+├── index.js                          # DB connection
+└── Schemas/
+    ├── auth/                         # Auth-related tables
+    │   ├── users.Schema.js
+    │   ├── userSessions.Schema.js
+    │   ├── otpVerification.Schema.js
+    │   ├── passwordResets.Schema.js
+    │   └── index.js                  # barrel export
+    │
+    ├── companies/                    # Company-related tables
+    │   ├── company.Schema.js
+    │   ├── branch.Schema.js
+    │   ├── companyConnection.Schema.js
+    │   ├── documents.Schema.js
+    │   └── index.js
+    │
+    ├── subscription/                 # Billing tables
+    │   ├── subscrptionPlan.Schema.js
+    │   ├── companySubscription.Schema.js
+    │   └── index.js
+    │
+    └── schema.Helper.Columns/        # Shared helpers
+        └── column.Helper.js          # timestamps object
+```
+
+**Each folder has an `index.js`** that re-exports everything:
+
+```javascript
+// Schemas/auth/index.js
+export * from "./users.Schema.js";
+export * from "./otpVerification.Schema.js";
+export * from "./userSessions.Schema.js";
+export * from "./passwordResets.Schema.js";
+```
+
+---
+
+### 1.5.6 Writing a Schema (Table Definition)
+
+Every schema file follows this pattern:
+
+```javascript
+// 1. Import types from drizzle pg-core
+import {
+  pgTable,
+  uuid,
+  varchar,
+  boolean,
+  timestamp,
+  pgEnum,
+} from "drizzle-orm/pg-core";
+
+// 2. Import shared timestamps helper
+import { timestamps } from "../schema.Helper.Columns/column.Helper.js";
+
+// 3. Define enums (if needed)
+export const statusEnum = pgEnum("status_name", ["value1", "value2", "value3"]);
+
+// 4. Define table
+export const tableName = pgTable("table_name", {
+  // Primary key (UUID, auto-generated)
+  id: uuid("id").defaultRandom().primaryKey(),
+
+  // Foreign keys (UUID, references another table)
+  companyId: uuid("company_id").references(() => otherTable.id),
+
+  // Text fields
+  name: varchar("name", { length: 255 }).notNull(),
+  email: varchar("email", { length: 255 }).notNull().unique(),
+
+  // Boolean
+  isActive: boolean("is_active").default(true),
+
+  // Enum
+  status: statusEnum("status").default("active"),
+
+  // Timestamps (shared helper)
+  ...timestamps,
+});
+```
+
+---
+
+### 1.5.7 Common Column Types
+
+| Drizzle Type                       | PostgreSQL    | Use For                   |
+| ---------------------------------- | ------------- | ------------------------- |
+| `uuid('id').defaultRandom()`       | UUID          | Primary keys, IDs         |
+| `varchar('col', { length: 255 })`  | VARCHAR(255)  | Names, emails, short text |
+| `varchar('col', { length: 1000 })` | VARCHAR(1000) | URLs                      |
+| `text('col')`                      | TEXT          | Long content, addresses   |
+| `boolean('col')`                   | BOOLEAN       | True/false flags          |
+| `integer('col')`                   | INTEGER       | Numbers, counts           |
+| `timestamp('col')`                 | TIMESTAMP     | Dates and times           |
+| `pgEnum('name', [...])`            | ENUM          | Fixed set of options      |
+
+---
+
+### 1.5.8 Column Modifiers (Chaining Order)
+
+```javascript
+// Type first, then chain modifiers:
+columnName: type("db_column_name", options)
+  .primaryKey() // if primary key
+  .references() // if foreign key
+  .unique() // if must be unique
+  .notNull() // if required
+  .default(value) // if has default value
+  .defaultRandom() // for UUID auto-generation
+  .$onUpdate(); // run on every update
+```
+
+**Key rules:**
+
+- `.primaryKey()` already implies `.notNull()` - don't add both
+- `.defaultRandom()` → PostgreSQL generates UUID automatically
+- `$onUpdate(() => new Date())` → auto-updates timestamp on every UPDATE
+
+---
+
+### 1.5.9 Shared Timestamps Helper
+
+Create `src/db/Schemas/schema.Helper.Columns/column.Helper.js`:
+
+```javascript
+import { timestamp } from "drizzle-orm/pg-core";
+
+export const timestamps = {
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").$onUpdate(() => new Date()),
+  deletedAt: timestamp("deleted_at"),
+};
+```
+
+Use in every schema with spread operator:
+
+```javascript
+export const users = pgTable("users", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  name: varchar("name", { length: 255 }),
+  ...timestamps, // ← adds createdAt, updatedAt, deletedAt automatically
+});
+```
+
+---
+
+### 1.5.10 References (Foreign Keys)
+
+When one table references another:
+
+```javascript
+// Import the table you want to reference
+import { companies } from "./company.Schema.js";
+
+// Use arrow function in .references()
+companyId: uuid("company_id").references(() => companies.id);
+//                                        ↑ arrow function prevents circular dependency
+```
+
+**Rules:**
+
+- Always use arrow function: `() => table.id`
+- Never use braces: `() => { table.id }` ← returns undefined!
+- Import the referenced table at top of file
+- Always add `.js` extension in imports (ES modules requirement)
+
+---
+
+### 1.5.11 Index Files (Barrel Exports)
+
+Every schema folder has an `index.js` that collects all exports:
+
+```javascript
+// Schemas/companies/index.js
+export * from "./company.Schema.js";
+export * from "./branch.Schema.js";
+export * from "./documents.Schema.js";
+export * from "./companyConnection.Schema.js";
+```
+
+**Benefit:** Import from one place instead of multiple files:
+
+```javascript
+// Without index.js (messy):
+import { companies } from "#schemas/companies/company.Schema.js";
+import { branch } from "#schemas/companies/branch.Schema.js";
+
+// With index.js (clean):
+import { companies, branch } from "#schemas/companies/index.js";
+```
+
+---
+
+### 1.5.12 Schema Push Workflow
+
+After creating or modifying any schema:
+
+```bash
+# 1. Make sure PostgreSQL is running
+docker-compose up -d
+
+# 2. Push changes to database
+pnpm drizzle-kit push
+
+# 3. Verify in Drizzle Studio (optional)
+pnpm drizzle-kit studio
+```
+
+**Common errors:**
+
+- `Cannot read properties of undefined (reading 'table')` → broken reference (wrong import or `() => { table.id }` with braces)
+- `ERR_MODULE_NOT_FOUND` → missing `.js` extension in import
+- `type does not exist` → enum conflict, reset database with `docker volume prune -f`
+
+---
+
+## 1.6 The `app.js` File (Express Setup)
 
 This is where you configure Express. Think of it as the "settings" file for your server.
 
 **What goes in `app.js`:**
+
 1. Security middleware (helmet, cors)
 2. Body parsers (json, urlencoded)
 3. All API routes
@@ -150,25 +485,28 @@ This is where you configure Express. Think of it as the "settings" file for your
 5. Global error handler (LAST)
 
 **Template:**
+
 ```javascript
-import express from 'express';
-import helmet from 'helmet';
-import cors from 'cors';
-import { errorHandler } from '#middleware/error/errorHandler.js';
-import { errorResponse } from '#utils/response.js';
+import express from "express";
+import helmet from "helmet";
+import cors from "cors";
+import { errorHandler } from "#middleware/error/errorHandler.js";
+import { errorResponse } from "#utils/response.js";
 
 export const app = express();
 
 // 1. Security
 app.use(helmet());
-app.use(cors({
-  origin: process.env.FRONTEND_URL,
-  credentials: true   // lowercase 'c', with 's' at end
-}));
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL,
+    credentials: true, // lowercase 'c', with 's' at end
+  }),
+);
 
 // 2. Body parsers
-app.use(express.json({ limit: '16kb' }));
-app.use(express.urlencoded({ extended: true, limit: '16kb' }));
+app.use(express.json({ limit: "16kb" }));
+app.use(express.urlencoded({ extended: true, limit: "16kb" }));
 
 // 3. Routes
 // app.use('/api/v1/companies', companyRoutes);
@@ -185,28 +523,29 @@ app.use(errorHandler);
 
 ---
 
-## 1.6 The `index.js` File (Server Start)
+## 1.7 The `index.js` File (Server Start)
 
 This is the entry point. Its only job is to:
+
 1. Check database connection
 2. Start the server
 
 ```javascript
-import 'dotenv/config';
-import { app } from './app.js';
-import { db } from '#db/index.js';
+import "dotenv/config";
+import { app } from "./app.js";
+import { db } from "#db/index.js";
 
 const startServer = async () => {
   try {
-    await db.execute('SELECT 1');   // test DB connection
-    console.log('Database connected');
+    await db.execute("SELECT 1"); // test DB connection
+    console.log("Database connected");
 
     app.listen(process.env.PORT, () => {
       console.log(`Server running on port ${process.env.PORT}`);
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);   // exit with error code (important for Docker)
+    console.error("Failed to start server:", error);
+    process.exit(1); // exit with error code (important for Docker)
   }
 };
 
@@ -218,19 +557,20 @@ If the database is down, there's no point starting the server. This prevents acc
 
 ---
 
-## 1.7 Naming Conventions
+## 1.8 Naming Conventions
 
-| Location | Convention | Example |
-|----------|-----------|---------|
-| File names | kebab-case | `company-routes.js` |
-| Schema property | camelCase | `companyName` |
-| Database column | snake_case | `company_name` |
-| JavaScript variables | camelCase | `const companyData` |
-| Constants | UPPER_SNAKE | `const MAX_USERS = 5` |
-| Classes | PascalCase | `class AppError` |
-| URL endpoints | kebab-case | `/api/v1/company-types` |
+| Location             | Convention  | Example                 |
+| -------------------- | ----------- | ----------------------- |
+| File names           | kebab-case  | `company-routes.js`     |
+| Schema property      | camelCase   | `companyName`           |
+| Database column      | snake_case  | `company_name`          |
+| JavaScript variables | camelCase   | `const companyData`     |
+| Constants            | UPPER_SNAKE | `const MAX_USERS = 5`   |
+| Classes              | PascalCase  | `class AppError`        |
+| URL endpoints        | kebab-case  | `/api/v1/company-types` |
 
 **One rule for all imports:**
+
 - Use `#alias` paths everywhere (never relative paths like `../../`)
 - Always include `.js` extension in imports
 
@@ -260,6 +600,7 @@ success JSON              ↓
 ```
 
 **The 4 pieces:**
+
 1. `asyncHandler` - wraps controller, auto-catches errors
 2. `AppError` - creates errors with status codes
 3. `response.js` - formats success and error JSON
@@ -274,22 +615,30 @@ success JSON              ↓
 **Three functions:**
 
 ### `successResponse` - for successful operations
+
 ```javascript
-export function successResponse(res, data, message = 'Success', statusCode = 200) {
+export function successResponse(
+  res,
+  data,
+  message = "Success",
+  statusCode = 200,
+) {
   return res.status(statusCode).json({
     success: true,
     message,
-    data
+    data,
   });
 }
 ```
 
 Usage in controller:
+
 ```javascript
-return successResponse(res, company, 'Company created', 201);
+return successResponse(res, company, "Company created", 201);
 ```
 
 Client receives:
+
 ```json
 {
   "success": true,
@@ -301,40 +650,53 @@ Client receives:
 ---
 
 ### `errorResponse` - for known business errors
+
 ```javascript
-export function errorResponse(res, message = 'Error', statusCode = 500, error = null) {
+export function errorResponse(
+  res,
+  message = "Error",
+  statusCode = 500,
+  error = null,
+) {
   return res.status(statusCode).json({
     success: false,
     message,
-    ...(error && { error })
+    ...(error && { error }),
   });
 }
 ```
 
 Usage:
+
 ```javascript
-return errorResponse(res, 'Company not found', 404);
-return errorResponse(res, 'Internal Server Error', 500);
+return errorResponse(res, "Company not found", 404);
+return errorResponse(res, "Internal Server Error", 500);
 ```
 
 ---
 
 ### `validationErrorResponse` - for input validation failures
+
 ```javascript
-export function validationErrorResponse(res, message = 'Validation failed', error) {
+export function validationErrorResponse(
+  res,
+  message = "Validation failed",
+  error,
+) {
   return res.status(400).json({
     success: false,
     message,
-    error
+    error,
   });
 }
 ```
 
 Usage:
+
 ```javascript
-return validationErrorResponse(res, 'Validation failed', {
-  email: 'Email is required',
-  phone: 'Invalid phone number'
+return validationErrorResponse(res, "Validation failed", {
+  email: "Email is required",
+  phone: "Invalid phone number",
 });
 ```
 
@@ -349,37 +711,39 @@ return validationErrorResponse(res, 'Validation failed', {
 ```javascript
 export class AppError extends Error {
   constructor(message, statusCode) {
-    super(message);          // sets error.message
-    this.statusCode = statusCode;  // custom field
+    super(message); // sets error.message
+    this.statusCode = statusCode; // custom field
   }
 }
 ```
 
 **Why extend Error?**
+
 - `throw` only works with Error objects (or subclasses)
 - You need the standard `error.message` field
 - You add your own `statusCode` field
 
 **When to use:**
+
 ```javascript
 // When something is wrong but it's a known business rule
-throw new AppError('Email already exists', 409);
-throw new AppError('Company not found', 404);
-throw new AppError('Not authorized', 401);
+throw new AppError("Email already exists", 409);
+throw new AppError("Company not found", 404);
+throw new AppError("Not authorized", 401);
 ```
 
 **Common HTTP status codes:**
 
-| Code | Meaning | Example |
-|------|---------|---------|
-| 200 | OK | Data retrieved |
-| 201 | Created | Resource created |
-| 400 | Bad Request | Invalid input |
-| 401 | Unauthorized | Not logged in |
-| 403 | Forbidden | Not allowed |
-| 404 | Not Found | Resource doesn't exist |
-| 409 | Conflict | Email already exists |
-| 500 | Server Error | Unexpected crash |
+| Code | Meaning      | Example                |
+| ---- | ------------ | ---------------------- |
+| 200  | OK           | Data retrieved         |
+| 201  | Created      | Resource created       |
+| 400  | Bad Request  | Invalid input          |
+| 401  | Unauthorized | Not logged in          |
+| 403  | Forbidden    | Not allowed            |
+| 404  | Not Found    | Resource doesn't exist |
+| 409  | Conflict     | Email already exists   |
+| 500  | Server Error | Unexpected crash       |
 
 ---
 
@@ -404,16 +768,13 @@ export const asyncHandler = (fn) => {
 ```javascript
 // asyncHandler is a function that TAKES a function (your controller)
 const asyncHandler = (fn) => {
-
   // It RETURNS a new function (this is what Express actually calls)
   return async (req, res, next) => {
-
     try {
-      await fn(req, res, next);  // runs YOUR controller
+      await fn(req, res, next); // runs YOUR controller
     } catch (error) {
-      next(error);  // forwards error to errorHandler middleware
+      next(error); // forwards error to errorHandler middleware
     }
-
   };
 };
 ```
@@ -422,13 +783,15 @@ const asyncHandler = (fn) => {
 Express needs a function to call on each request. You can't call your controller immediately - you just hand it to Express wrapped in a safety net.
 
 **Usage:**
+
 ```javascript
 // Wrap your controller when defining routes
-router.post('/register', asyncHandler(registerCompany));
+router.post("/register", asyncHandler(registerCompany));
 //                        ↑ returns a wrapped function, not calls it
 ```
 
 **The trade:**
+
 - ❌ Without asyncHandler: Write try/catch in every controller
 - ✅ With asyncHandler: Write zero try/catch, errors auto-forwarded
 
@@ -439,11 +802,11 @@ router.post('/register', asyncHandler(registerCompany));
 **Purpose:** The "receiver" of all errors forwarded by asyncHandler. Sends clean JSON to client.
 
 ```javascript
-import { errorResponse } from '#utils/response.js';
+import { errorResponse } from "#utils/response.js";
 
 export const errorHandler = (err, req, res, next) => {
   const statusCode = err.statusCode || 500;
-  const message = err.message || 'Internal Server Error';
+  const message = err.message || "Internal Server Error";
   return errorResponse(res, message, statusCode);
 };
 ```
@@ -452,8 +815,9 @@ export const errorHandler = (err, req, res, next) => {
 Express identifies an error handler by its 4 parameters `(err, req, res, next)`. If you write 3 params, Express treats it as normal middleware and errors won't reach it.
 
 **Register it LAST in app.js:**
+
 ```javascript
-app.use(errorHandler);  // Must be the very last app.use()
+app.use(errorHandler); // Must be the very last app.use()
 ```
 
 **Why last?**
@@ -464,6 +828,7 @@ Express processes middleware top to bottom. The error handler must be at the bot
 ## 2.6 How All 4 Pieces Work Together
 
 ### Scenario 1: Everything works fine
+
 ```
 POST /api/companies/register
         ↓
@@ -479,6 +844,7 @@ Client receives: { success: true, data: {...} }
 ---
 
 ### Scenario 2: Known business error (duplicate email)
+
 ```
 POST /api/companies/register
         ↓
@@ -504,6 +870,7 @@ Client receives: { success: false, message: 'Email already exists' }
 ---
 
 ### Scenario 3: Unexpected crash (DB down)
+
 ```
 POST /api/companies/register
         ↓
@@ -530,33 +897,34 @@ Client receives: { success: false, message: 'connection refused' }
 ## 2.7 Writing a Controller (Putting It All Together)
 
 ```javascript
-import { asyncHandler } from '#utils/asyncHandler.js';
-import { AppError } from '#utils/AppError.js';
-import { successResponse, validationErrorResponse } from '#utils/response.js';
-import { db } from '#db/index.js';
-import { companies } from '#schemas/companies/index.js';
-import { eq } from 'drizzle-orm';
-import { generateEnrouteCompanyId } from '#utils/generators.js';
+import { asyncHandler } from "#utils/asyncHandler.js";
+import { AppError } from "#utils/AppError.js";
+import { successResponse, validationErrorResponse } from "#utils/response.js";
+import { db } from "#db/index.js";
+import { companies } from "#schemas/companies/index.js";
+import { eq } from "drizzle-orm";
+import { generateEnrouteCompanyId } from "#utils/generators.js";
 
 export const registerCompany = asyncHandler(async (req, res) => {
   const { companyName, companyEmail, companyType } = req.body;
 
   // Step 1: Validate input
   if (!companyName || !companyEmail || !companyType) {
-    return validationErrorResponse(res, 'Validation failed', {
-      companyName: !companyName ? 'Required' : null,
-      companyEmail: !companyEmail ? 'Required' : null,
-      companyType: !companyType ? 'Required' : null,
+    return validationErrorResponse(res, "Validation failed", {
+      companyName: !companyName ? "Required" : null,
+      companyEmail: !companyEmail ? "Required" : null,
+      companyType: !companyType ? "Required" : null,
     });
   }
 
   // Step 2: Check for duplicates
-  const existing = await db.select()
+  const existing = await db
+    .select()
     .from(companies)
     .where(eq(companies.companyEmail, companyEmail));
 
   if (existing.length > 0) {
-    throw new AppError('Company email already exists', 409);
+    throw new AppError("Company email already exists", 409);
     // asyncHandler catches this → next(error) → errorHandler handles it
   }
 
@@ -564,20 +932,29 @@ export const registerCompany = asyncHandler(async (req, res) => {
   const enrouteCompanyId = generateEnrouteCompanyId(companyType);
 
   // Step 4: Insert into database
-  const [newCompany] = await db.insert(companies).values({
-    companyName,
-    companyEmail,
-    companyType,
-    enrouteCompanyId,
-    status: 'pending'
-  }).returning();
+  const [newCompany] = await db
+    .insert(companies)
+    .values({
+      companyName,
+      companyEmail,
+      companyType,
+      enrouteCompanyId,
+      status: "pending",
+    })
+    .returning();
 
   // Step 5: Send success response
-  return successResponse(res, newCompany, 'Company registered successfully', 201);
+  return successResponse(
+    res,
+    newCompany,
+    "Company registered successfully",
+    201,
+  );
 });
 ```
 
 **Notice:**
+
 - ✅ No try/catch (asyncHandler handles it)
 - ✅ Uses validationErrorResponse for bad input
 - ✅ Uses AppError for business rule violations
@@ -589,23 +966,24 @@ export const registerCompany = asyncHandler(async (req, res) => {
 ## 2.8 Writing Routes
 
 ```javascript
-import { Router } from 'express';
-import { registerCompany } from '#controllers/company.controller.js';
+import { Router } from "express";
+import { registerCompany } from "#controllers/company.controller.js";
 
 const router = Router();
 
 // POST /api/v1/companies/register
-router.post('/register', registerCompany);
+router.post("/register", registerCompany);
 //           ↑ path    ↑ controller (asyncHandler is inside the controller)
 
 export default router;
 ```
 
 Connect in `app.js`:
-```javascript
-import companyRoutes from '#routes/company.routes.js';
 
-app.use('/api/v1/companies', companyRoutes);
+```javascript
+import companyRoutes from "#routes/company.routes.js";
+
+app.use("/api/v1/companies", companyRoutes);
 // Full path becomes: POST /api/v1/companies/register
 ```
 
@@ -613,45 +991,48 @@ app.use('/api/v1/companies', companyRoutes);
 
 ## 2.9 Quick Reference - When to Use What
 
-| Situation | What to Use |
-|-----------|------------|
-| Request succeeded | `successResponse(res, data, message, statusCode)` |
-| Input validation failed | `validationErrorResponse(res, message, errors)` |
-| Known business error (email exists, not found) | `throw new AppError(message, statusCode)` |
-| Route not found | `errorResponse(res, message, 404)` in 404 handler |
-| Wrapping a controller | `asyncHandler(yourController)` |
-| Receiving all thrown errors | `errorHandler` middleware (auto, last in app.js) |
+| Situation                                      | What to Use                                       |
+| ---------------------------------------------- | ------------------------------------------------- |
+| Request succeeded                              | `successResponse(res, data, message, statusCode)` |
+| Input validation failed                        | `validationErrorResponse(res, message, errors)`   |
+| Known business error (email exists, not found) | `throw new AppError(message, statusCode)`         |
+| Route not found                                | `errorResponse(res, message, 404)` in 404 handler |
+| Wrapping a controller                          | `asyncHandler(yourController)`                    |
+| Receiving all thrown errors                    | `errorHandler` middleware (auto, last in app.js)  |
 
 ---
 
 ## 2.10 Common Mistakes to Avoid
 
 ### ❌ Mistake 1: Forgetting `return`
+
 ```javascript
 // Wrong - sends 2 responses, crashes
 if (!email) {
-  validationErrorResponse(res, 'Email required', {});
+  validationErrorResponse(res, "Email required", {});
 }
 // continues execution and sends another response!
 
 // Correct
 if (!email) {
-  return validationErrorResponse(res, 'Email required', {});
+  return validationErrorResponse(res, "Email required", {});
 }
 ```
 
 ### ❌ Mistake 2: errorHandler not last
+
 ```javascript
 // Wrong - routes added after errorHandler won't have error handling
 app.use(errorHandler);
-app.use('/api/v1/companies', companyRoutes);  // errors here won't be caught
+app.use("/api/v1/companies", companyRoutes); // errors here won't be caught
 
 // Correct
-app.use('/api/v1/companies', companyRoutes);
-app.use(errorHandler);  // LAST
+app.use("/api/v1/companies", companyRoutes);
+app.use(errorHandler); // LAST
 ```
 
 ### ❌ Mistake 3: Only 3 params in errorHandler
+
 ```javascript
 // Wrong - Express won't treat this as error handler
 app.use((req, res, next) => { ... });
@@ -661,15 +1042,17 @@ app.use((err, req, res, next) => { ... });
 ```
 
 ### ❌ Mistake 4: Storing JWT in localStorage
+
 ```javascript
 // Wrong - vulnerable to XSS attacks
-localStorage.setItem('token', token);
+localStorage.setItem("token", token);
 
 // Correct - use HttpOnly cookies
-res.cookie('accessToken', token, { httpOnly: true, secure: true });
+res.cookie("accessToken", token, { httpOnly: true, secure: true });
 ```
 
 ### ❌ Mistake 5: Storing plain passwords
+
 ```javascript
 // Wrong - never ever
 await db.insert(users).values({ password: req.body.password });
@@ -681,8 +1064,7 @@ await db.insert(users).values({ passwordHash: hash });
 
 ---
 
-*This document is updated as new backend concepts are learned and implemented in the EnrouteLogTech project.*
-
+_This document is updated as new backend concepts are learned and implemented in the EnrouteLogTech project._
 
 ---
 
@@ -693,6 +1075,7 @@ await db.insert(users).values({ passwordHash: hash });
 ## 3.1 Why a Global Email Service?
 
 In a real application, you send many different types of emails:
+
 - OTP verification
 - Welcome after registration
 - Company approved/rejected by admin
@@ -703,6 +1086,7 @@ In a real application, you send many different types of emails:
 If you write email logic separately in every controller, it becomes messy and hard to maintain. Instead, build **one global email service** that every part of your app uses.
 
 **The pattern:**
+
 ```
 Any Controller
       ↓
@@ -738,6 +1122,7 @@ src/
 ```
 
 **Why separate templates from service?**
+
 - Templates are just HTML strings (UI concern)
 - Service is the sending logic (backend concern)
 - Easy to update a template without touching sending logic
@@ -760,12 +1145,14 @@ EMAIL_FROM=noreply@yourdomain.com
 ```
 
 **Important `.env` rules:**
+
 - Comments use `#` NOT `//`
 - Port `465` → `EMAIL_SECURE=true` (SSL)
 - Port `587` → `EMAIL_SECURE=false` (TLS/STARTTLS)
 - Never push `.env` to GitHub (make sure it's in `.gitignore`)
 
 **For development/testing use Mailtrap:**
+
 ```env
 EMAIL_HOST=smtp.mailtrap.io
 EMAIL_PORT=2525
@@ -784,12 +1171,12 @@ EMAIL_FROM=noreply@enroutelogtech.com
 A transporter is created ONCE when the server starts and reused for every email:
 
 ```javascript
-import nodemailer from 'nodemailer';
+import nodemailer from "nodemailer";
 
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
-  port: Number(process.env.EMAIL_PORT),   // ← Must be a number, not string
-  secure: process.env.EMAIL_SECURE === 'true',  // ← Convert string to boolean
+  port: Number(process.env.EMAIL_PORT), // ← Must be a number, not string
+  secure: process.env.EMAIL_SECURE === "true", // ← Convert string to boolean
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASSWORD,
@@ -798,6 +1185,7 @@ const transporter = nodemailer.createTransport({
 ```
 
 **Common mistakes:**
+
 - `port` must be `Number(process.env.EMAIL_PORT)` - env vars are strings, nodemailer needs a number
 - `secure` must be a boolean - use `=== 'true'` to convert from string
 - Create transporter at module level (once), not inside the function (every call)
@@ -814,13 +1202,14 @@ export const sendEmail = async ({ to, subject, html, text }) => {
     from: process.env.EMAIL_FROM,
     to,
     subject,
-    html,    // HTML version (shown in modern email clients)
-    text,    // Plain text fallback (shown if HTML fails)
+    html, // HTML version (shown in modern email clients)
+    text, // Plain text fallback (shown if HTML fails)
   });
 };
 ```
 
 **Parameters:**
+
 - `to` - recipient email address
 - `subject` - email subject line
 - `html` - HTML content of the email
@@ -837,9 +1226,9 @@ Each specific function wraps `sendEmail` with the right subject and template:
 export async function sendOtpEmail(email, otp) {
   await sendEmail({
     to: email,
-    subject: 'EnrouteLogTech - Email Verification OTP',
+    subject: "EnrouteLogTech - Email Verification OTP",
     html: otpEmailTemplate(otp),
-    text: `Your OTP is: ${otp}. Valid for 10 minutes. Do not share.`
+    text: `Your OTP is: ${otp}. Valid for 10 minutes. Do not share.`,
   });
 }
 
@@ -847,9 +1236,9 @@ export async function sendOtpEmail(email, otp) {
 export async function sendWelcomeEmail(email, name) {
   await sendEmail({
     to: email,
-    subject: 'Welcome to EnrouteLogTech - Application Received',
+    subject: "Welcome to EnrouteLogTech - Application Received",
     html: welcomeEmailTemplate(name),
-    text: `Welcome ${name}! Your application is under review.`
+    text: `Welcome ${name}! Your application is under review.`,
   });
 }
 
@@ -857,9 +1246,9 @@ export async function sendWelcomeEmail(email, name) {
 export async function sendApprovalEmail(email, companyName) {
   await sendEmail({
     to: email,
-    subject: 'EnrouteLogTech - Your Account is Approved!',
+    subject: "EnrouteLogTech - Your Account is Approved!",
     html: approvalEmailTemplate(companyName),
-    text: `Congratulations! ${companyName} has been approved.`
+    text: `Congratulations! ${companyName} has been approved.`,
   });
 }
 
@@ -867,9 +1256,9 @@ export async function sendApprovalEmail(email, companyName) {
 export async function sendRejectionEmail(email, companyName, reason) {
   await sendEmail({
     to: email,
-    subject: 'EnrouteLogTech - Application Status Update',
+    subject: "EnrouteLogTech - Application Status Update",
     html: rejectionEmailTemplate(companyName, reason),
-    text: `Application for ${companyName} was not approved. Reason: ${reason}`
+    text: `Application for ${companyName} was not approved. Reason: ${reason}`,
   });
 }
 ```
@@ -907,6 +1296,7 @@ export function otpEmailTemplate(otp) {
 ```
 
 **Template rules:**
+
 - Always use inline CSS (email clients don't support stylesheets)
 - Keep it simple - complex layouts break in some email clients
 - Always have a plain text fallback in `sendEmail()`
@@ -917,7 +1307,10 @@ export function otpEmailTemplate(otp) {
 ## 3.9 How to Use in Controllers
 
 ```javascript
-import { sendOtpEmail, sendWelcomeEmail } from '#services/email/email.service.js';
+import {
+  sendOtpEmail,
+  sendWelcomeEmail,
+} from "#services/email/email.service.js";
 
 // In your auth controller
 export const sendOtp = asyncHandler(async (req, res) => {
@@ -930,18 +1323,18 @@ export const sendOtp = asyncHandler(async (req, res) => {
   await db.insert(otpVerification).values({
     email,
     otp,
-    expiresAt: new Date(Date.now() + 10 * 60 * 1000)  // 10 min
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 min
   });
 
   // Send email - wrap in try/catch so email failure doesn't crash the API
   try {
     await sendOtpEmail(email, otp);
   } catch (emailError) {
-    console.error('Email sending failed:', emailError.message);
+    console.error("Email sending failed:", emailError.message);
     // Don't throw - still respond to user, just log the error
   }
 
-  return successResponse(res, null, 'OTP sent to your email', 200);
+  return successResponse(res, null, "OTP sent to your email", 200);
 });
 ```
 
@@ -952,14 +1345,16 @@ export const sendOtp = asyncHandler(async (req, res) => {
 ## 3.10 OTP Security Best Practices
 
 ### Generate OTP securely:
+
 ```javascript
-import crypto from 'crypto';
+import crypto from "crypto";
 
 // More secure than Math.random()
 const otp = crypto.randomInt(100000, 999999).toString();
 ```
 
 ### Hash the OTP before storing (optional but more secure):
+
 ```javascript
 import bcrypt from 'bcrypt';
 
@@ -981,20 +1376,22 @@ const isValid = await bcrypt.compare(userEnteredOtp, storedHashedOtp);
 ```
 
 ### OTP Expiry Check in DB:
+
 ```javascript
-const otpRecord = await db.select()
+const otpRecord = await db
+  .select()
   .from(otpVerification)
   .where(
     and(
       eq(otpVerification.email, email),
       eq(otpVerification.isUsed, false),
-      gt(otpVerification.expiresAt, new Date())  // not expired
-    )
+      gt(otpVerification.expiresAt, new Date()), // not expired
+    ),
   )
   .limit(1);
 
 if (!otpRecord.length) {
-  throw new AppError('OTP expired or invalid', 400);
+  throw new AppError("OTP expired or invalid", 400);
 }
 ```
 
@@ -1044,29 +1441,29 @@ Make sure `package.json` has this in `imports`:
 ```
 
 Then import like:
+
 ```javascript
-import { sendOtpEmail } from '#services/email/email.service.js';
+import { sendOtpEmail } from "#services/email/email.service.js";
 ```
 
 ---
 
 ## 3.13 Quick Reference - Common Mistakes
 
-| Mistake | Why it breaks | Fix |
-|---------|--------------|-----|
-| `port: process.env.EMAIL_PORT` | String, not number | `Number(process.env.EMAIL_PORT)` |
-| `secure: process.env.EMAIL_SECURE` | String, not boolean | `=== 'true'` |
-| Port 465 + `secure: false` | SSL mismatch | Port 465 needs `secure: true` |
-| Port 587 + `secure: true` | TLS mismatch | Port 587 needs `secure: false` |
-| Comments with `//` in `.env` | Invalid syntax | Use `#` for comments |
-| No plain text fallback | Breaks plain email clients | Always provide `text:` field |
-| Not wrapping in try/catch in controller | Email crash crashes API | Always wrap email calls in try/catch |
-| Pushing `.env` to GitHub | Exposes credentials | Always check `.gitignore` |
+| Mistake                                 | Why it breaks              | Fix                                  |
+| --------------------------------------- | -------------------------- | ------------------------------------ |
+| `port: process.env.EMAIL_PORT`          | String, not number         | `Number(process.env.EMAIL_PORT)`     |
+| `secure: process.env.EMAIL_SECURE`      | String, not boolean        | `=== 'true'`                         |
+| Port 465 + `secure: false`              | SSL mismatch               | Port 465 needs `secure: true`        |
+| Port 587 + `secure: true`               | TLS mismatch               | Port 587 needs `secure: false`       |
+| Comments with `//` in `.env`            | Invalid syntax             | Use `#` for comments                 |
+| No plain text fallback                  | Breaks plain email clients | Always provide `text:` field         |
+| Not wrapping in try/catch in controller | Email crash crashes API    | Always wrap email calls in try/catch |
+| Pushing `.env` to GitHub                | Exposes credentials        | Always check `.gitignore`            |
 
 ---
 
-*Chapter 3 complete. Next: Chapter 4 - Authentication (JWT, Sessions, Middleware)*
-
+_Chapter 3 complete. Next: Chapter 4 - Authentication (JWT, Sessions, Middleware)_
 
 ---
 
@@ -1077,6 +1474,7 @@ import { sendOtpEmail } from '#services/email/email.service.js';
 ## 4.1 The Big Picture - Why This Architecture?
 
 Most beginners put email + password login only. But for a B2B SaaS platform you need:
+
 - Email verification before registration (OTP)
 - Company + user created together
 - Admin approval before login is allowed
@@ -1092,16 +1490,19 @@ Most beginners put email + password login only. But for a B2B SaaS platform you 
 After login, the server gives the user a token (like a wristband at a concert). Every future request, the user shows that token. Server reads it and knows who they are.
 
 A JWT looks like:
+
 ```
 eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOjF9.abc123xyz
 ```
 
 Three parts separated by dots:
+
 ```
 HEADER . PAYLOAD . SIGNATURE
 ```
 
 ### Payload (what you store inside the token):
+
 ```javascript
 {
   userId: "uuid",
@@ -1115,10 +1516,10 @@ HEADER . PAYLOAD . SIGNATURE
 
 ### Two Tokens Strategy
 
-| Token | Expires | Purpose |
-|-------|---------|---------|
-| Access Token | 15 minutes | Authorize every API request |
-| Refresh Token | 30 days | Generate new access token silently |
+| Token         | Expires    | Purpose                            |
+| ------------- | ---------- | ---------------------------------- |
+| Access Token  | 15 minutes | Authorize every API request        |
+| Refresh Token | 30 days    | Generate new access token silently |
 
 **Why two?**
 Access token expires fast → less damage if stolen.
@@ -1127,17 +1528,17 @@ Refresh token lets users stay logged in for 30 days without re-entering password
 ### JWT Utility (`utils/jwt.js`)
 
 ```javascript
-import jwt from 'jsonwebtoken';
+import jwt from "jsonwebtoken";
 
 export function generateAccessToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN   // '15m'
+    expiresIn: process.env.JWT_EXPIRES_IN, // '15m'
   });
 }
 
 export function generateRefreshToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN   // '30d'
+    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN, // '30d'
   });
 }
 
@@ -1200,8 +1601,9 @@ Step 5: POST /auth/submit-registration
 ## 4.4 OTP Implementation
 
 ### Generate secure OTP:
+
 ```javascript
-import crypto from 'crypto';
+import crypto from "crypto";
 
 // Better than Math.random() - cryptographically secure
 const otp = crypto.randomInt(100000, 999999).toString();
@@ -1209,6 +1611,7 @@ const otp = crypto.randomInt(100000, 999999).toString();
 ```
 
 ### Save to DB:
+
 ```javascript
 const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 // Date.now()      = current time in milliseconds
@@ -1219,35 +1622,38 @@ await db.insert(otpVerification).values({
   email,
   otp,
   expiresAt,
-  isUsed: false
+  isUsed: false,
 });
 ```
 
 ### Verify OTP:
-```javascript
-import { and, eq, gt } from 'drizzle-orm';
 
-const data = await db.select()
+```javascript
+import { and, eq, gt } from "drizzle-orm";
+
+const data = await db
+  .select()
   .from(otpVerification)
   .where(
     and(
       eq(otpVerification.email, email),
       eq(otpVerification.isUsed, false),
-      gt(otpVerification.expiresAt, new Date())   // expiresAt > now
-    )
+      gt(otpVerification.expiresAt, new Date()), // expiresAt > now
+    ),
   )
   .limit(1);
 
 if (data.length === 0) {
-  throw new AppError('OTP expired or invalid', 400);
+  throw new AppError("OTP expired or invalid", 400);
 }
 
 if (data[0].otp !== otp) {
-  throw new AppError('Invalid OTP', 400);
+  throw new AppError("Invalid OTP", 400);
 }
 
 // Mark as used
-await db.update(otpVerification)
+await db
+  .update(otpVerification)
   .set({ isUsed: true })
   .where(eq(otpVerification.id, data[0].id));
 ```
@@ -1259,7 +1665,7 @@ await db.update(otpVerification)
 **Never store plain passwords. Always hash with bcrypt.**
 
 ```javascript
-import bcrypt from 'bcrypt';
+import bcrypt from "bcrypt";
 
 // Hash on registration
 const hashedPassword = await bcrypt.hash(password, 12);
@@ -1276,27 +1682,29 @@ const isValid = await bcrypt.compare(enteredPassword, storedHash);
 ## 4.6 Enroute Company ID Generation
 
 Every company gets a unique ID based on their type:
+
 - `CUS-XXXXXXXX` → Customer
 - `TRN-XXXXXXXX` → Transporter
 - `BRK-XXXXXXXX` → Broker
 - `FLT-XXXXXXXX` → Fleet Owner
 
 **Generator function pattern:**
+
 ```javascript
-import crypto from 'crypto';
+import crypto from "crypto";
 
 export const generateEnrouteId = (companyType) => {
   const prefix = {
-    customer: 'CUS',
-    transporter: 'TRN',
-    broker: 'BRK',
-    fleetOwner: 'FLT',
+    customer: "CUS",
+    transporter: "TRN",
+    broker: "BRK",
+    fleetOwner: "FLT",
   };
 
   const selectedPrefix = prefix[companyType];
 
   if (!selectedPrefix) {
-    throw new Error('Invalid company type');
+    throw new Error("Invalid company type");
   }
 
   // crypto.randomUUID() = "550e8400-e29b-41d4-a716-446655440000"
@@ -1380,15 +1788,15 @@ POST /api/v1/auth/reset-password    (future)
 
 ## 4.11 Common Mistakes in Auth
 
-| Mistake | Correct Approach |
-|---------|-----------------|
-| `Math.random()` for OTP | Use `crypto.randomInt()` |
-| Storing plain password | Always `bcrypt.hash()` |
-| Storing JWT in localStorage | Use HttpOnly cookies |
-| No OTP expiry check | Always check `expiresAt > now` |
-| Not marking OTP as used | Always set `isUsed: true` after verify |
-| Missing `return` on validation | Always add `return` before response |
-| `!data` check on DB result | DB always returns array - check `data.length === 0` |
+| Mistake                        | Correct Approach                                    |
+| ------------------------------ | --------------------------------------------------- |
+| `Math.random()` for OTP        | Use `crypto.randomInt()`                            |
+| Storing plain password         | Always `bcrypt.hash()`                              |
+| Storing JWT in localStorage    | Use HttpOnly cookies                                |
+| No OTP expiry check            | Always check `expiresAt > now`                      |
+| Not marking OTP as used        | Always set `isUsed: true` after verify              |
+| Missing `return` on validation | Always add `return` before response                 |
+| `!data` check on DB result     | DB always returns array - check `data.length === 0` |
 
 ---
 
@@ -1399,15 +1807,19 @@ POST /api/v1/auth/reset-password    (future)
 ## 5.1 Why You Can't Use `express.json()` for Files
 
 When frontend sends JSON:
+
 ```
 Content-Type: application/json
 ```
+
 Express reads it fine with `app.use(express.json())`.
 
 When frontend sends a file:
+
 ```
 Content-Type: multipart/form-data
 ```
+
 This is binary data mixed with text. Express cannot parse this. You need **Multer**.
 
 ---
@@ -1415,6 +1827,7 @@ This is binary data mixed with text. Express cannot parse this. You need **Multe
 ## 5.2 What Multer Does
 
 Multer parses `multipart/form-data` and puts:
+
 - Text fields → `req.body`
 - Uploaded file → `req.file` (single) or `req.files` (multiple)
 
@@ -1426,13 +1839,17 @@ With Multer: `req.file = { buffer, originalname, mimetype, size }`
 ## 5.3 Storage Types
 
 ### Disk Storage
+
 File saved on server's hard disk.
+
 - Problem: Server restart = files survive but disk fills up
 - Problem: Multiple servers = file on wrong server
 - NOT recommended for production
 
 ### Memory Storage (Use This)
+
 File held in RAM as a buffer.
+
 - You immediately send buffer to cloud storage (R2)
 - Nothing saved on server disk
 - Recommended for production
@@ -1446,33 +1863,34 @@ const storage = multer.memoryStorage();
 ## 5.4 Multer Configuration (`middleware/upload.middleware.js`)
 
 ```javascript
-import multer from 'multer';
-import { AppError } from '#utils/AppError.js';
+import multer from "multer";
+import { AppError } from "#utils/AppError.js";
 
 const storage = multer.memoryStorage();
 
 export const upload = multer({
   storage,
   limits: {
-    fileSize: 5 * 1024 * 1024   // 5MB max
+    fileSize: 5 * 1024 * 1024, // 5MB max
     // 5 * 1024 = 5KB * 1024 = 5MB in bytes
   },
   fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf'];
+    const allowed = ["image/jpeg", "image/png", "image/jpg", "application/pdf"];
 
     if (allowed.includes(file.mimetype)) {
-      cb(null, true);    // null = no error, true = accept file
+      cb(null, true); // null = no error, true = accept file
     } else {
-      cb(new AppError('Only JPG, PNG and PDF allowed', 400), false);
+      cb(new AppError("Only JPG, PNG and PDF allowed", 400), false);
     }
-  }
+  },
 });
 ```
 
 ### Usage in routes:
+
 ```javascript
 // upload.single('file') = expect one file with field name 'file'
-router.post('/upload', upload.single('file'), uploadDocument);
+router.post("/upload", upload.single("file"), uploadDocument);
 //                     ↑ middleware           ↑ controller
 //                     runs first             runs after
 ```
@@ -1482,6 +1900,7 @@ router.post('/upload', upload.single('file'), uploadDocument);
 ## 5.5 What is Cloudflare R2?
 
 R2 is cloud object storage (like a hard drive on the internet):
+
 - You upload a file → R2 stores it permanently
 - R2 gives you a public URL
 - Files survive server restarts
@@ -1489,6 +1908,7 @@ R2 is cloud object storage (like a hard drive on the internet):
 - Uses the same API as S3
 
 **Why not store on your server?**
+
 - Server restarts: files might be lost
 - Multiple servers: file exists on only one
 - Storage costs: server disk is expensive
@@ -1501,21 +1921,21 @@ R2 is cloud object storage (like a hard drive on the internet):
 R2 uses the S3-compatible API from `@aws-sdk/client-s3`:
 
 ```javascript
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 // Create connection once - reuse for all uploads
 const r2Client = new S3Client({
-  region: 'auto',   // R2 doesn't use regions like AWS
+  region: "auto", // R2 doesn't use regions like AWS
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
     accessKeyId: process.env.R2_ACCESS_KEY_ID,
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-  }
+  },
 });
 
 export const uploadToR2 = async (file, companyId, documentType) => {
   // 1. Get file extension
-  const extension = file.originalname.split('.').pop();
+  const extension = file.originalname.split(".").pop();
   // "gst-certificate.pdf".split('.') = ['gst-certificate', 'pdf']
   // .pop() = 'pdf' (last item)
 
@@ -1525,12 +1945,14 @@ export const uploadToR2 = async (file, companyId, documentType) => {
   // Date.now() = milliseconds since 1970 = always unique
 
   // 3. Upload to R2
-  await r2Client.send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET_NAME,
-    Key: filename,          // path inside bucket
-    Body: file.buffer,      // raw file bytes from multer memory storage
-    ContentType: file.mimetype,
-  }));
+  await r2Client.send(
+    new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: filename, // path inside bucket
+      Body: file.buffer, // raw file bytes from multer memory storage
+      ContentType: file.mimetype,
+    }),
+  );
 
   // 4. Return public URL
   return `${process.env.R2_PUBLIC_URL}/${filename}`;
@@ -1623,6 +2045,7 @@ R2_PUBLIC_URL=https://pub-xxxxxxxx.r2.dev
 ```
 
 **Where to find:**
+
 - Account ID: Cloudflare Dashboard → Right sidebar
 - Access Key + Secret: R2 → Manage R2 API Tokens → Create Token
 - Public URL: R2 → Your Bucket → Settings → Enable Public Access
@@ -1640,16 +2063,16 @@ pnpm add @aws-sdk/client-s3
 
 ## 5.12 Common Mistakes in File Upload
 
-| Mistake | Correct Approach |
-|---------|-----------------|
-| Using disk storage | Use `memoryStorage()` |
-| No file size limit | Set `fileSize: 5 * 1024 * 1024` |
-| No file type check | Always add `fileFilter` |
-| Variable name mismatch | `filename` vs `fileName` - be consistent |
-| Missing `async` on upload function | R2 upload is async, always add `async` |
-| No `Content-Type` in upload | Always set `ContentType: file.mimetype` |
-| Storing file URL wrong | Use the variable name you defined |
+| Mistake                            | Correct Approach                         |
+| ---------------------------------- | ---------------------------------------- |
+| Using disk storage                 | Use `memoryStorage()`                    |
+| No file size limit                 | Set `fileSize: 5 * 1024 * 1024`          |
+| No file type check                 | Always add `fileFilter`                  |
+| Variable name mismatch             | `filename` vs `fileName` - be consistent |
+| Missing `async` on upload function | R2 upload is async, always add `async`   |
+| No `Content-Type` in upload        | Always set `ContentType: file.mimetype`  |
+| Storing file URL wrong             | Use the variable name you defined        |
 
 ---
 
-*Chapter 5 complete. Next: Chapter 6 - Login, Logout, Session Management*
+_Chapter 5 complete. Next: Chapter 6 - Login, Logout, Session Management_
