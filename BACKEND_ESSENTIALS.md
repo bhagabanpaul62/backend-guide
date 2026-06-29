@@ -13,6 +13,7 @@
 3. [Chapter 3: Setting Up Email Notification System](#chapter-3-setting-up-email-notification-system)
 4. [Chapter 4: Authentication System (OTP, Register, JWT)](#chapter-4-authentication-system-otp-register-jwt)
 5. [Chapter 5: File Upload System (Multer + Cloudflare R2)](#chapter-5-file-upload-system-multer--cloudflare-r2)
+6. [Chapter 6: Access Token, Refresh Token & Session Management](#chapter-6-access-token-refresh-token--session-management)
 
 ---
 
@@ -2076,3 +2077,443 @@ pnpm add @aws-sdk/client-s3
 ---
 
 _Chapter 5 complete. Next: Chapter 6 - Login, Logout, Session Management_
+
+---
+
+---
+
+# Chapter 6: Access Token, Refresh Token & Session Management
+
+## 6.1 The Problem Tokens Solve
+
+HTTP is stateless — the server forgets you after every request. Tokens are like a wristband at a concert. After login, you get a wristband. Every request, you show it. Server reads it and knows who you are.
+
+---
+
+## 6.2 Real-World Analogy
+
+### Access Token = Day Pass at an Office Building
+
+- Security gives you a pass when you enter
+- Expires at end of day (15 minutes in our case)
+- You show it at every door
+- If expired → go back to security desk
+
+### Refresh Token = Employee ID Card
+
+- Lasts 1 year (30 days in our case)
+- When day pass expires → show employee ID → get new day pass
+- If employee ID expires → full interview again (login again)
+
+---
+
+## 6.3 Why TWO Tokens? Why Not One?
+
+### One long-lived token (BAD):
+
+```
+Token stolen → attacker has 30 DAYS of access
+No way to stop them
+```
+
+### Two tokens (GOOD):
+
+```
+Access token stolen → attacker has only 15 MINUTES
+After 15 min → they need refresh token (harder to steal)
+Refresh token → checked against session DB → can be revoked by logout
+```
+
+**Short access token = less damage if compromised.**
+**Long refresh token = good UX (user stays logged in).**
+
+---
+
+## 6.4 Token Lifecycle
+
+### Login (Getting Both Tokens)
+
+```
+User logs in → credentials verified
+        ↓
+Server creates:
+  accessToken  (15 minutes)
+  refreshToken (30 days)
+        ↓
+Both set as HttpOnly cookies
+        ↓
+Session record created in userSessions table
+        ↓
+User is "logged in"
+```
+
+### Every API Request (Using Access Token)
+
+```
+Browser sends cookies automatically with every request
+        ↓
+authMiddleware reads accessToken from cookie
+        ↓
+jwt.verify(accessToken) → { userId, companyId, role, sessionId }
+        ↓
+Checks session is active in DB
+        ↓
+req.user = { userId, companyId, role }
+        ↓
+Controller runs
+```
+
+### After 15 Minutes (Access Token Expires)
+
+```
+Request made → authMiddleware → jwt.verify() → "TokenExpiredError"
+        ↓
+Server responds 401
+        ↓
+Frontend detects 401 → calls POST /auth/refresh-token
+(refreshToken cookie still valid)
+        ↓
+Server verifies refreshToken
+        ↓
+Checks session in DB (isActive = true?)
+        ↓
+Generates NEW accessToken → sets new cookie
+        ↓
+Frontend retries original request → works!
+        ↓
+User never notices anything happened
+```
+
+### After 30 Days (Refresh Token Expires)
+
+```
+Frontend calls /refresh-token
+        ↓
+Server verifies → "TokenExpiredError"
+        ↓
+401 "Session expired, login again"
+        ↓
+User redirected to login page
+```
+
+### Logout
+
+```
+User clicks logout
+        ↓
+Session marked isActive = false in DB
+        ↓
+Both cookies cleared
+        ↓
+Even stolen tokens become useless
+(session is inactive in DB → server rejects them)
+```
+
+---
+
+## 6.5 Token Contents (JWT Payload)
+
+### Access Token Payload (all info needed per request):
+
+```javascript
+{
+  userId: "uuid",
+  companyId: "uuid",
+  role: "admin",
+  sessionId: "uuid",
+  iat: 1718345678,    // issued at (auto)
+  exp: 1718346578     // expires at (auto)
+}
+```
+
+### Refresh Token Payload (minimal info):
+
+```javascript
+{
+  userId: "uuid",
+  sessionId: "uuid",
+  iat: 1718345678,
+  exp: 1720937678
+}
+```
+
+**Refresh token has LESS data** — longer-lived = more risk = store less.
+
+---
+
+## 6.6 Cookie Settings
+
+```javascript
+const cookieOptions = {
+  httpOnly: true, // JS cannot read it (prevents XSS)
+  secure: process.env.NODE_ENV === "production", // HTTPS only in prod
+  sameSite: "strict", // prevents CSRF attacks
+};
+
+// Access Token - short lived
+res.cookie("accessToken", token, {
+  ...cookieOptions,
+  maxAge: 15 * 60 * 1000, // 15 minutes
+});
+
+// Refresh Token - long lived
+res.cookie("refreshToken", token, {
+  ...cookieOptions,
+  maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+});
+```
+
+### Why HttpOnly?
+
+```
+localStorage: JavaScript can read it → XSS attack can steal it
+HttpOnly cookie: JavaScript CANNOT read it → safe from XSS
+Browser sends it automatically → no frontend code needed
+```
+
+### Why sameSite: 'strict'?
+
+Prevents other websites from using your cookies (CSRF protection).
+
+---
+
+## 6.7 Session Table (userSessions)
+
+The session table is the **kill switch** for tokens. Even if someone has a valid token, you can revoke access by marking the session inactive.
+
+```
+userSessions table:
+- id (UUID)
+- userId (FK → users)
+- refreshToken (stored here for verification)
+- deviceId (browser/device info)
+- ipAddress (client IP)
+- isActive (true/false - the kill switch!)
+- expiresAt (30 days from login)
+- createdAt
+```
+
+### Why store session in DB?
+
+Without session table:
+
+```
+User logs out → tokens still valid until they expire!
+Attacker with stolen token → still works for 15 min!
+```
+
+With session table:
+
+```
+User logs out → session.isActive = false
+Attacker tries stolen token → authMiddleware checks session → inactive → 401!
+Immediate revocation!
+```
+
+---
+
+## 6.8 One User One Session Rule
+
+```javascript
+// Before creating new session in login:
+const existingSession = await db
+  .select()
+  .from(userSessions)
+  .where(
+    and(
+      eq(userSessions.userId, user.id),
+      eq(userSessions.isActive, true),
+      gt(userSessions.expiresAt, new Date()),
+    ),
+  )
+  .limit(1);
+
+if (existingSession.length > 0) {
+  throw new AppError("Account active on another device. Logout first.", 409);
+}
+```
+
+**Prevents:** Credential sharing between employees.
+**Business value:** Forces companies to buy more user seats.
+
+---
+
+## 6.9 Login Flow (Token Creation)
+
+```javascript
+// 1. Create session FIRST (need session.id for token)
+const [session] = await db.insert(userSessions).values({
+  userId: user.id,
+  deviceId: req.headers['user-agent'],
+  ipAddress: req.ip,
+  isActive: true,
+  expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+}).returning();
+
+// 2. Generate tokens WITH session.id
+const accessToken = generateAccessToken({
+  userId: user.id,
+  companyId: user.companyId,
+  role: user.userRole,
+  sessionId: session.id
+});
+
+const refreshToken = generateRefreshToken({
+  userId: user.id,
+  sessionId: session.id
+});
+
+// 3. Save refreshToken to session (for later verification)
+await db.update(userSessions)
+  .set({ refreshToken })
+  .where(eq(userSessions.id, session.id));
+
+// 4. Set cookies
+res.cookie('accessToken', accessToken, { ...options, maxAge: 15min });
+res.cookie('refreshToken', refreshToken, { ...options, maxAge: 30days });
+```
+
+**Order matters:**
+
+1. Session created (get ID)
+2. Tokens generated (use session ID)
+3. Session updated (store refresh token)
+4. Cookies set (send to browser)
+
+---
+
+## 6.10 authMiddleware (Token Verification on Every Request)
+
+```javascript
+export const authMiddleware = asyncHandler(async (req, res, next) => {
+  // 1. Read token from cookie
+  const token = req.cookies.accessToken;
+  if (!token) throw new AppError("Not authenticated", 401);
+
+  // 2. Verify token (throws if invalid/expired)
+  const decoded = verifyToken(token);
+
+  // 3. Check session still active in DB
+  const [session] = await db
+    .select()
+    .from(userSessions)
+    .where(
+      and(
+        eq(userSessions.id, decoded.sessionId),
+        eq(userSessions.isActive, true),
+      ),
+    )
+    .limit(1);
+
+  if (!session) throw new AppError("Session expired or revoked", 401);
+
+  // 4. Attach user info to request
+  req.user = {
+    userId: decoded.userId,
+    companyId: decoded.companyId,
+    role: decoded.role,
+    sessionId: decoded.sessionId,
+  };
+
+  // 5. Continue
+  next();
+});
+```
+
+---
+
+## 6.11 Refresh Token Flow
+
+```javascript
+export const refreshToken = asyncHandler(async (req, res) => {
+  // 1. Get refresh token from cookie
+  const token = req.cookies.refreshToken;
+  if (!token) throw new AppError('No refresh token', 401);
+
+  // 2. Verify it
+  const decoded = verifyToken(token);
+
+  // 3. Find session in DB
+  const [session] = await db.select()
+    .from(userSessions)
+    .where(
+      and(
+        eq(userSessions.id, decoded.sessionId),
+        eq(userSessions.isActive, true),
+        gt(userSessions.expiresAt, new Date())
+      )
+    )
+    .limit(1);
+
+  if (!session) throw new AppError('Session expired, login again', 401);
+
+  // 4. Get user data (for new token payload)
+  const [user] = await db.select().from(users)
+    .where(eq(users.id, decoded.userId)).limit(1);
+
+  // 5. Generate new access token
+  const newAccessToken = generateAccessToken({
+    userId: user.id,
+    companyId: user.companyId,
+    role: user.userRole,
+    sessionId: session.id
+  });
+
+  // 6. Set new cookie
+  res.cookie('accessToken', newAccessToken, { httpOnly, secure, maxAge: 15min });
+
+  return successResponse(res, null, 'Token refreshed', 200);
+});
+```
+
+---
+
+## 6.12 Logout Flow
+
+```javascript
+export const logout = asyncHandler(async (req, res) => {
+  // 1. Get session from token (or cookie)
+  const token = req.cookies.accessToken;
+
+  if (token) {
+    try {
+      const decoded = verifyToken(token);
+      // 2. Mark session inactive
+      await db
+        .update(userSessions)
+        .set({ isActive: false })
+        .where(eq(userSessions.id, decoded.sessionId));
+    } catch (err) {
+      // Token might be expired, that's OK - just clear cookies
+    }
+  }
+
+  // 3. Clear cookies regardless
+  res.clearCookie("accessToken");
+  res.clearCookie("refreshToken");
+
+  return successResponse(res, null, "Logged out successfully", 200);
+});
+```
+
+---
+
+## 6.13 Summary Table
+
+| Token   | Lives In             | Expires | Contains                           | Purpose                 |
+| ------- | -------------------- | ------- | ---------------------------------- | ----------------------- |
+| Access  | HttpOnly Cookie      | 15 min  | userId, companyId, role, sessionId | Authorize every request |
+| Refresh | HttpOnly Cookie + DB | 30 days | userId, sessionId                  | Get new access token    |
+
+| Event                 | What Happens                                             |
+| --------------------- | -------------------------------------------------------- |
+| Login                 | Create session → generate both tokens → set cookies      |
+| API Request           | authMiddleware verifies access token + checks session DB |
+| Token Expired (15m)   | Frontend calls /refresh-token → gets new access token    |
+| Logout                | Session.isActive = false → clear cookies                 |
+| Session Expired (30d) | Must login again                                         |
+| Token Stolen          | Logout kills session → stolen token rejected             |
+
+---
+
+_Chapter 6 complete. Next: Chapter 7 - Role-Based Access Control (Middleware)_
