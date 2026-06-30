@@ -2517,3 +2517,201 @@ export const logout = asyncHandler(async (req, res) => {
 ---
 
 _Chapter 6 complete. Next: Chapter 7 - Role-Based Access Control (Middleware)_
+
+---
+
+## 6.14 Stateless vs Stateful Authentication
+
+### What is Stateless Authentication?
+
+**Stateless** = Server stores NOTHING about the user's session. Everything needed is inside the token itself.
+
+```
+Pure Stateless:
+  Login → Server gives JWT
+  Every request → Server reads JWT, trusts the data inside
+  Server doesn't check any database
+  Server doesn't store sessions
+
+  JWT contains: { userId, companyId, role, exp }
+  Server verifies signature → trusts it → allows access
+```
+
+**How it works:**
+
+```
+Request → Read token → Verify signature → Trust payload → Done
+No database call needed!
+```
+
+**Pros:**
+
+- Very fast (no DB call per request)
+- Scales easily (any server can verify the token)
+- Simple to implement
+
+**Cons:**
+
+- Cannot revoke a token before it expires
+- If token stolen → active until expiry (no kill switch)
+- Logout doesn't truly "kill" the token
+- Can't enforce one-session rule
+
+---
+
+### What is Stateful Authentication?
+
+**Stateful** = Server stores session information in a database and checks it on every request.
+
+```
+Pure Stateful (Traditional Sessions):
+  Login → Server creates session in DB → gives session ID as cookie
+  Every request → Server looks up session ID in DB → gets user info
+  Logout → Server deletes session from DB
+
+  Cookie contains: just a session ID (not user data)
+  Server checks DB every time
+```
+
+**How it works:**
+
+```
+Request → Read session ID → Query DB → Get user info → Done
+Database call on EVERY request!
+```
+
+**Pros:**
+
+- Full control (can revoke instantly)
+- Logout truly kills the session
+- Can enforce one-session rule
+- Can track all active sessions
+
+**Cons:**
+
+- Slower (DB call on every request)
+- DB becomes bottleneck at scale
+- More complex infrastructure
+
+---
+
+### What EnrouteLogTech Uses: HYBRID Approach
+
+You built a **hybrid system** — best of both worlds:
+
+```
+YOUR SYSTEM:
+  JWT (stateless) for fast verification
+  + Session DB (stateful) for revocation control
+```
+
+**How your hybrid works:**
+
+```
+Request
+  ↓
+Read JWT from cookie (fast)
+  ↓
+Verify JWT signature (fast, no DB)
+  ↓
+Extract { userId, companyId, role, sessionId }
+  ↓
+Check session in DB: isActive = true? (one small query)
+  ↓
+If active → allow
+If inactive → reject (even if JWT is valid!)
+```
+
+**Benefits:**
+
+- ✅ Fast (JWT verification is instant)
+- ✅ Revocable (check session DB)
+- ✅ One-session rule works (check existing sessions)
+- ✅ Logout truly kills access (session.isActive = false)
+- ✅ Token theft protection (kill session → token useless)
+
+---
+
+### Comparison Table
+
+| Feature              | Pure Stateless             | Pure Stateful             | Hybrid (Your System)       |
+| -------------------- | -------------------------- | ------------------------- | -------------------------- |
+| Speed                | Very fast                  | Slower (DB every request) | Fast (JWT + 1 small query) |
+| Revoke token         | Cannot                     | Instant                   | Instant (session kill)     |
+| Logout effectiveness | Weak (token still valid)   | Strong                    | Strong                     |
+| One-session rule     | Not possible               | Possible                  | Possible ✅                |
+| Scalability          | Excellent                  | DB bottleneck             | Good                       |
+| Complexity           | Simple                     | Medium                    | Medium                     |
+| Used by              | Public APIs, microservices | Traditional web apps      | Modern SaaS (your case)    |
+
+---
+
+### When to Use Which?
+
+| Use Case                           | Best Approach        |
+| ---------------------------------- | -------------------- |
+| Public API (no revocation needed)  | Pure Stateless       |
+| Microservices (service-to-service) | Pure Stateless       |
+| Traditional web app (simple)       | Pure Stateful        |
+| B2B SaaS (need control + speed)    | Hybrid ✅            |
+| Banking/Finance (maximum security) | Hybrid + IP checking |
+| Single-page app (React/Next.js)    | Hybrid ✅            |
+
+---
+
+### Why NOT Pure Stateless for EnrouteLogTech?
+
+Your business rules require:
+
+1. **One user one session** → Need DB to track active sessions
+2. **Instant logout** → Need DB to kill session immediately
+3. **Admin can block user** → Need to revoke access instantly
+4. **Prevent credential sharing** → Need session tracking
+
+Pure stateless JWT cannot do ANY of these. That's why you added the session table.
+
+---
+
+### Why NOT Pure Stateful for EnrouteLogTech?
+
+1. **Performance** → Checking full session data from DB on every request is slow
+2. **JWT carries user info** → No need to query user table on every request
+3. **Scalability** → JWT verification is CPU-only, no DB bottleneck
+4. **Token contains role** → Authorization without extra DB query
+
+---
+
+### Your System In One Sentence
+
+**"JWT for speed, session DB for control."**
+
+JWT answers: "Who is this person?" (fast, no DB)
+Session DB answers: "Are they still allowed?" (one query)
+
+---
+
+### Visual: How Each Request Flows Through Your Hybrid System
+
+```
+Request with cookie
+        ↓
+┌─────────────────────────┐
+│ JWT VERIFICATION (fast) │
+│ No database needed       │
+│ Checks: signature valid? │
+│ Checks: not expired?     │
+│ Result: { userId, role } │
+└────────────┬────────────┘
+             ↓
+┌─────────────────────────┐
+│ SESSION CHECK (1 query) │
+│ DB query: userSessions   │
+│ Checks: isActive = true? │
+│ If false → REJECT        │
+│ If true → ALLOW          │
+└────────────┬────────────┘
+             ↓
+        Controller runs
+```
+
+**Total cost per request:** 1 JWT verify (CPU) + 1 small DB query = very efficient.
