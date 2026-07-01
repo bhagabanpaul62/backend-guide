@@ -9,11 +9,13 @@
 ## Table of Contents
 
 1. [Chapter 1: Setting Up the Backend](#chapter-1-setting-up-the-backend)
-2. [Chapter 2: Utility Functions & Error Handling System](#chapter-2-utility-functions--error-handling-system)
-3. [Chapter 3: Setting Up Email Notification System](#chapter-3-setting-up-email-notification-system)
-4. [Chapter 4: Authentication System (OTP, Register, JWT)](#chapter-4-authentication-system-otp-register-jwt)
-5. [Chapter 5: File Upload System (Multer + Cloudflare R2)](#chapter-5-file-upload-system-multer--cloudflare-r2)
-6. [Chapter 6: Access Token, Refresh Token & Session Management](#chapter-6-access-token-refresh-token--session-management)
+2. [Chapter 2: Docker - Development & Production Setup](#chapter-2-docker---development--production-setup)
+3. [Chapter 3: Utility Functions & Error Handling System](#chapter-3-utility-functions--error-handling-system)
+4. [Chapter 4: Setting Up Email Notification System](#chapter-4-setting-up-email-notification-system)
+5. [Chapter 5: Authentication System (OTP, Register, JWT)](#chapter-5-authentication-system-otp-register-jwt)
+6. [Chapter 6: File Upload System (Multer + Cloudflare R2)](#chapter-6-file-upload-system-multer--cloudflare-r2)
+7. [Chapter 7: Access Token, Refresh Token & Session Management](#chapter-7-access-token-refresh-token--session-management)
+8. [Chapter 6: Access Token, Refresh Token & Session Management](#chapter-6-access-token-refresh-token--session-management)
 
 ---
 
@@ -2715,3 +2717,760 @@ Request with cookie
 ```
 
 **Total cost per request:** 1 JWT verify (CPU) + 1 small DB query = very efficient.
+
+---
+
+---
+
+# Chapter 2: Docker — Development & Production Setup
+
+## 2.1 What is Docker and Why Use It?
+
+Without Docker:
+
+```
+Developer A: Works on Windows, Node 18, PostgreSQL 14
+Developer B: Works on Mac, Node 20, PostgreSQL 16
+Production:  Runs on Ubuntu, Node 22, PostgreSQL 18
+
+Result: "It works on my machine but not on yours"
+```
+
+With Docker:
+
+```
+Everyone runs the SAME containerized environment
+Same Node version, same PostgreSQL version, same OS layer
+"Works on my machine" = "Works everywhere"
+```
+
+**Docker containers are like:**
+
+- Isolated boxes that contain your app + all its dependencies
+- Run the same way on any machine
+- Can be started, stopped, rebuilt in seconds
+
+---
+
+## 2.2 Core Docker Concepts
+
+### Image
+
+A blueprint/template for a container. Like a class in programming.
+
+```
+node:22-alpine    ← Node.js 22 on Alpine Linux (small image)
+postgres:18.4     ← PostgreSQL 18.4 official image
+```
+
+### Container
+
+A running instance of an image. Like an object from a class.
+
+```
+You can run 5 containers from the same image
+Each is isolated from each other
+```
+
+### Dockerfile
+
+Instructions to BUILD your own image from a base image.
+
+```dockerfile
+FROM node:22-alpine     # Start from official Node image
+COPY . .                # Copy your code into it
+RUN pnpm install        # Install dependencies
+CMD ["node", "index.js"] # What to run when started
+```
+
+### docker-compose.yml
+
+Orchestrates MULTIPLE containers together.
+
+```yaml
+services:
+  postgres: ... # container 1
+  backend: ... # container 2
+  frontend: ... # container 3
+```
+
+---
+
+## 2.3 Project Structure with Docker
+
+```
+ENROUTE/
+├── docker-compose.yml      ← orchestrates all services
+├── backend/
+│   ├── Dockerfile          ← builds backend container
+│   ├── .dockerignore       ← files NOT copied into container
+│   ├── pnpm-workspace.yaml ← pnpm build script permissions
+│   └── src/...
+└── frontend/
+    ├── Dockerfile          ← builds frontend container
+    ├── .dockerignore
+    ├── pnpm-workspace.yaml
+    └── src/...
+```
+
+---
+
+## 2.4 Development Setup (What You Built)
+
+### docker-compose.yml (Development)
+
+```yaml
+services:
+  postgres:
+    image: postgres:18.4
+    ports:
+      - "5432:5432" # host:container
+    environment:
+      POSTGRES_DB: enroute
+      POSTGRES_USER: enrouteDb
+      POSTGRES_PASSWORD: enroute09832
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enrouteDb -d enroute"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy # wait for postgres to be READY
+    env_file:
+      - ./backend/.env
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    env_file:
+      - ./frontend/.env
+```
+
+**Key points:**
+
+- `ports: "5432:5432"` means host port 5432 maps to container port 5432
+- `healthcheck` → backend waits for postgres to ACTUALLY be ready (not just started)
+- `depends_on: condition: service_healthy` → wait for healthcheck to pass
+- `env_file` → loads your .env file into the container
+
+---
+
+### Backend Dockerfile (Development)
+
+```dockerfile
+FROM node:22-alpine
+
+RUN corepack enable
+
+# Install build tools for bcrypt (native C++ compilation)
+RUN apk add --no-cache python3 make g++
+
+WORKDIR /app
+
+# Copy package files first (layer caching optimization)
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+
+# Install all dependencies
+RUN pnpm install --frozen-lockfile
+
+# Copy rest of code
+COPY . .
+
+EXPOSE 8000
+
+CMD ["pnpm", "start"]
+```
+
+**Why `apk add python3 make g++`?**
+`bcrypt` is a native Node.js module that compiles C++ code during install. Alpine Linux is minimal — it doesn't have build tools. You must install them manually.
+
+**Why copy `package.json` before `COPY . .`?**
+Docker builds in layers. If only your code changes (not dependencies), Docker reuses the cached `pnpm install` layer. Much faster rebuilds.
+
+---
+
+### Frontend Dockerfile (Development)
+
+```dockerfile
+FROM node:22-alpine
+
+RUN corepack enable
+
+RUN apk add --no-cache python3 make g++
+
+WORKDIR /app
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+
+# --ignore-scripts prevents sharp/unrs-resolver build script errors
+RUN pnpm install --frozen-lockfile --ignore-scripts
+
+COPY . .
+
+EXPOSE 3000
+
+CMD ["pnpm", "dev"]
+```
+
+**Why `--ignore-scripts`?**
+Next.js includes `sharp` (image optimization) and `unrs-resolver`. These need to compile native code. In development Docker, we skip this with `--ignore-scripts` to avoid pnpm security policy errors.
+
+**Trade-off:** Image optimization via `sharp` won't work in dev. That's fine for development.
+
+---
+
+### `pnpm-workspace.yaml` — Allowing Build Scripts
+
+pnpm 11+ blocks all native build scripts by default for security. You must explicitly allow which packages can run build scripts.
+
+**Backend `pnpm-workspace.yaml`:**
+
+```yaml
+onlyBuiltDependencies:
+  - bcrypt
+  - esbuild
+```
+
+**Frontend `pnpm-workspace.yaml`:**
+
+```yaml
+onlyBuiltDependencies:
+  - sharp
+  - unrs-resolver
+```
+
+**Why?** Without this, pnpm throws `ERR_PNPM_IGNORED_BUILDS` and the build fails. This file tells pnpm: "Only these packages are allowed to run their install scripts."
+
+---
+
+## 2.5 Critical Development: DATABASE_URL Hostname
+
+### Local development (without Docker):
+
+```env
+DATABASE_URL="postgres://user:pass@localhost:5432/enroute"
+#                                   ↑ your computer
+```
+
+### Inside Docker container:
+
+```env
+DATABASE_URL="postgres://user:pass@postgres:5432/enroute"
+#                                   ↑ service name from docker-compose!
+```
+
+**Why?** Inside a Docker container, `localhost` means "this container itself." The postgres container is a separate container. Docker networking makes containers reachable by their service name (`postgres`).
+
+**This is the most common Docker mistake.** Always use the service name, never `localhost`, when inside Docker.
+
+---
+
+## 2.6 Docker Commands Reference
+
+```bash
+# Build and start all services
+docker-compose up --build
+
+# Start without rebuilding (uses cached images)
+docker-compose up
+
+# Start in background (detached)
+docker-compose up -d
+
+# Stop all containers
+docker-compose down
+
+# Stop AND delete volumes (resets database!)
+docker-compose down -v
+
+# View running containers
+docker ps
+
+# View logs for a service
+docker-compose logs backend
+docker-compose logs -f backend     # follow (live logs)
+
+# Execute command inside running container
+docker-compose exec backend sh     # open shell in backend
+
+# Complete cleanup (removes all images, containers, volumes)
+docker system prune -a --volumes -f
+```
+
+---
+
+## 2.7 Common Development Problems & Fixes
+
+### Problem 1: `nodemon: not found`
+
+**Cause:** nodemon is in devDependencies but Docker doesn't install dev tools in production mode.
+**Fix:** Use `node` directly in CMD. nodemon is only for local dev watching.
+
+In `backend/package.json`:
+
+```json
+"start": "node src/index.js"
+```
+
+---
+
+### Problem 2: `ECONNREFUSED` to postgres
+
+**Cause:** Either wrong hostname or postgres not ready yet.
+
+**Fix 1:** Change `localhost` to `postgres` in DATABASE_URL.
+
+**Fix 2:** Add healthcheck so backend waits for postgres:
+
+```yaml
+depends_on:
+  postgres:
+    condition: service_healthy
+```
+
+---
+
+### Problem 3: `ERR_PNPM_IGNORED_BUILDS`
+
+**Cause:** pnpm 11+ blocks native build scripts by default.
+
+**Fix:** Create `pnpm-workspace.yaml` with `onlyBuiltDependencies` listing allowed packages.
+
+---
+
+### Problem 4: pnpm version mismatch
+
+**Cause:** Different containers download different pnpm versions.
+
+**Fix:** Pin pnpm version in `package.json`:
+
+```json
+"packageManager": "pnpm@11.5.0"
+```
+
+---
+
+### Problem 5: `depends_on` doesn't wait for postgres
+
+**Cause:** `depends_on: - postgres` only waits for container START, not for PostgreSQL to be READY.
+
+**Fix:** Add healthcheck to postgres service and use `condition: service_healthy`.
+
+---
+
+### Problem 6: `--frozen-lockfile` fails
+
+**Cause:** `pnpm-lock.yaml` is outdated or doesn't match `package.json`.
+
+**Fix:** Run `pnpm install` locally first to update lockfile, then rebuild Docker.
+
+---
+
+## 2.8 Production Docker — What Changes and Why
+
+**The development setup is NOT suitable for production.** Here's every change needed and why.
+
+---
+
+### Change 1: Multi-Stage Build (Backend)
+
+**Development:**
+
+```dockerfile
+FROM node:22-alpine
+RUN apk add --no-cache python3 make g++
+RUN pnpm install --frozen-lockfile
+COPY . .
+CMD ["node", "src/index.js"]
+```
+
+**Production:**
+
+```dockerfile
+# Stage 1: Builder (installs everything, compiles native modules)
+FROM node:22-alpine AS builder
+RUN apk add --no-cache python3 make g++
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY . .
+
+# Stage 2: Runner (only production code, no build tools)
+FROM node:22-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/src ./src
+COPY --from=builder /app/package.json ./
+EXPOSE 8000
+CMD ["node", "src/index.js"]
+```
+
+**Why multi-stage?**
+
+- Build stage has `python3`, `make`, `g++` (600MB of build tools)
+- Runner stage copies ONLY compiled node_modules (no build tools)
+- Final image is 200MB instead of 800MB
+- Smaller image = faster deployment + less attack surface
+
+---
+
+### Change 2: No `nodemon` in Production
+
+**Development:** `CMD ["pnpm", "dev"]` or `CMD ["nodemon", "src/index.js"]`
+
+**Production:** `CMD ["node", "src/index.js"]`
+
+**Why?**
+
+- `nodemon` watches for file changes and restarts — useless in production (code never changes)
+- `nodemon` adds startup overhead and unnecessary process management
+- Production needs direct `node` execution for reliability
+
+---
+
+### Change 3: Frontend Build (Not Dev Server)
+
+**Development:**
+
+```dockerfile
+CMD ["pnpm", "dev"]    # Next.js dev server with hot reload
+```
+
+**Production:**
+
+```dockerfile
+RUN pnpm build         # Build optimized static files
+CMD ["pnpm", "start"]  # Run production Next.js server
+```
+
+**Why?**
+
+- Dev server compiles on-demand — slow, not optimized
+- `pnpm build` pre-compiles everything — fast, minified, optimized
+- Production uses static files + Node.js server
+
+---
+
+### Change 4: No Source Maps in Production
+
+In `next.config.mjs`:
+
+```javascript
+// Development: source maps enabled (easier debugging)
+// Production:
+const nextConfig = {
+  productionBrowserSourceMaps: false, // don't expose source code
+};
+```
+
+**Why?** Source maps expose your original source code to anyone with DevTools. Hide them in production.
+
+---
+
+### Change 5: Environment Variables — No `.env` Files
+
+**Development:**
+
+```yaml
+env_file:
+  - ./backend/.env # reads from file
+```
+
+**Production:**
+
+- Never have `.env` files on production servers
+- Use environment variables set by:
+  - Contabo VPS: set in shell environment
+  - Docker Swarm/Kubernetes: use secrets
+  - CI/CD pipeline: inject as build variables
+
+---
+
+### Change 6: Database Password Security
+
+**Development:**
+
+```yaml
+POSTGRES_PASSWORD: enroute09832 # simple password, stored in yaml
+```
+
+**Production:**
+
+```yaml
+POSTGRES_PASSWORD_FILE: /run/secrets/db_password # Docker secret
+# OR
+POSTGRES_PASSWORD: ${POSTGRES_PASSWORD} # environment variable (never hardcoded)
+```
+
+**Why?** Hardcoded passwords in docker-compose.yml get committed to git. Use secrets or environment injection.
+
+---
+
+### Change 7: Postgres Data Persistence
+
+**Development:**
+
+```yaml
+postgres:
+  image: postgres:18.4
+  # no volume = data lost on container restart
+```
+
+**Production:**
+
+```yaml
+postgres:
+  image: postgres:18.4
+  volumes:
+    - postgres_data:/var/lib/postgresql/data # persist data!
+
+volumes:
+  postgres_data:
+    driver: local
+```
+
+**Why?** Without a volume, ALL your database data is deleted when the container restarts. That means losing ALL user data, companies, sessions — everything.
+
+---
+
+### Change 8: Restart Policy
+
+**Development:** No restart policy (container crashes → stays crashed)
+
+**Production:**
+
+```yaml
+backend:
+  restart: unless-stopped # auto-restart on crash
+
+postgres:
+  restart: always # always restart, even after reboot
+```
+
+**Why?** Servers crash, get rebooted for updates. `restart: unless-stopped` means the container automatically comes back up after a reboot or crash.
+
+---
+
+### Change 9: Add Nginx Reverse Proxy
+
+**Development:** Direct port access
+
+```
+Browser → localhost:3000 (frontend)
+Browser → localhost:8000 (backend API)
+```
+
+**Production:** Nginx sits in front of everything
+
+```
+Browser → nginx:80 → frontend (port 3000 internal)
+Browser → nginx:80/api → backend (port 8000 internal)
+```
+
+**Why Nginx?**
+
+- Single entry point (port 80/443)
+- SSL termination (HTTPS)
+- Rate limiting
+- Static file serving
+- Load balancing (future)
+- Ports 8000/3000 are NOT exposed to internet
+
+```yaml
+# Production docker-compose addition:
+nginx:
+  image: nginx:alpine
+  ports:
+    - "80:80"
+    - "443:443"
+  volumes:
+    - ./nginx.conf:/etc/nginx/conf.d/default.conf
+    - ./ssl:/etc/nginx/ssl
+  depends_on:
+    - backend
+    - frontend
+```
+
+---
+
+### Change 10: NODE_ENV
+
+**Development:**
+
+```env
+NODE_ENV=development
+```
+
+**Production:**
+
+```env
+NODE_ENV=production
+```
+
+**Why it matters:**
+
+```javascript
+// In your app.js:
+secure: process.env.NODE_ENV === "production"; // HTTPS only for cookies
+
+// Express automatically:
+// - Disables detailed error messages
+// - Enables response caching
+// - Optimizes performance
+```
+
+---
+
+## 2.9 Development vs Production Comparison Table
+
+| Aspect         | Development            | Production                 |
+| -------------- | ---------------------- | -------------------------- |
+| Backend CMD    | `nodemon src/index.js` | `node src/index.js`        |
+| Frontend CMD   | `pnpm dev`             | `pnpm build && pnpm start` |
+| Build type     | Single stage           | Multi-stage                |
+| Image size     | ~800MB                 | ~200MB                     |
+| Source maps    | Enabled                | Disabled                   |
+| `.env` files   | Used                   | Not used (env injection)   |
+| Passwords      | Hardcoded OK           | Never hardcoded            |
+| DB volume      | Not needed             | Required                   |
+| Restart policy | None                   | `unless-stopped`           |
+| Nginx          | Not needed             | Required                   |
+| PORT exposure  | Direct (3000, 8000)    | Only 80/443 via Nginx      |
+| NODE_ENV       | development            | production                 |
+| Error messages | Detailed               | Generic                    |
+| pnpm install   | `--frozen-lockfile`    | `--frozen-lockfile --prod` |
+
+---
+
+## 2.10 .dockerignore — What NOT to Copy
+
+Create `.dockerignore` in both `backend/` and `frontend/`:
+
+```
+node_modules/
+.env
+.env.*
+.git/
+.gitignore
+*.md
+dist/
+build/
+.next/
+coverage/
+*.log
+```
+
+**Why?**
+
+- `node_modules/` is huge (hundreds of MB) — Docker installs them fresh
+- `.env` contains secrets — never copy into image
+- `.git/` is useless inside container
+- Smaller build context = faster Docker builds
+
+---
+
+## 2.11 Production docker-compose.yml (Complete)
+
+```yaml
+services:
+  postgres:
+    image: postgres:18.4
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  backend:
+    build:
+      context: ./backend
+      target: runner # use the runner stage
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      # ... other env vars
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    # NO ports exposed — nginx handles it
+
+  frontend:
+    build:
+      context: ./frontend
+      target: runner
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: https://yourdomain.com/api/v1
+    depends_on:
+      - backend
+    networks:
+      - internal
+    # NO ports exposed — nginx handles it
+
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+
+networks:
+  internal:
+    driver: bridge
+```
+
+---
+
+## 2.12 Quick Reference: Docker Checklist
+
+### Before going to production, verify:
+
+- [ ] Multi-stage builds (smaller images)
+- [ ] `node src/index.js` not `nodemon`
+- [ ] `pnpm build` for frontend
+- [ ] No `.env` files in containers (use env injection)
+- [ ] No hardcoded passwords
+- [ ] Postgres volume for data persistence
+- [ ] `restart: unless-stopped` on all services
+- [ ] Nginx reverse proxy (only 80/443 exposed)
+- [ ] `NODE_ENV=production`
+- [ ] `.dockerignore` files present
+- [ ] All `localhost` references changed to service names
+
+---
+
+_Chapter 2 complete. Next: Chapter 3 - Utility Functions & Error Handling_
